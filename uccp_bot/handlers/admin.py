@@ -7,7 +7,7 @@ from aiogram import Bot, F, Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.types import FSInputFile, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -28,8 +28,10 @@ from ..db.models import (
 )
 from ..keyboards.common import BTN_ADMIN, cancel_kb, main_menu
 from ..services import backup as backup_service
+from ..services import catalog_ops, user_ops
+from ..services.ops import ActionError
 from ..states import AdminFlow
-from ..utils import esc, fmt_dt, normalize_phone, utcnow
+from ..utils import esc, fmt_dt, normalize_phone
 from .lists import show_list
 
 router = Router(name="admin")
@@ -362,28 +364,13 @@ async def cb_user_status(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     target = await session.get(User, callback_data.id)
-    if target.id == user.id and callback_data.value != UserStatus.ACTIVE:
-        await call.answer("Нельзя заблокировать самого себя.", show_alert=True)
+    try:
+        await user_ops.set_status(session, bot, target, user, callback_data.value)
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
         return
-    target.status = callback_data.value
-    target.sync_flags()
     await session.commit()
     await call.answer("Статус изменён")
-
-    if target.tg_id:
-        messages = {
-            UserStatus.BLOCKED: texts.BLOCKED_HINT,
-            UserStatus.DISABLED: texts.DISABLED_HINT,
-            UserStatus.ACTIVE: "✅ Доступ к боту восстановлен.",
-        }
-        try:
-            await bot.send_message(
-                target.tg_id,
-                messages.get(target.status, ""),
-                reply_markup=main_menu(target),
-            )
-        except Exception:
-            pass
     await cb_user_card(call, AdminCB(act="user_card", id=target.id), session, user)
 
 
@@ -400,7 +387,7 @@ async def cb_user_payment(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     target = await session.get(User, callback_data.id)
-    target.fixed_payment = not target.fixed_payment
+    await user_ops.set_fixed_payment(session, bot, target, user, not target.fixed_payment)
     await session.commit()
     await call.answer(
         "Фиксированная месячная оплата: стоимость по заявкам больше не спрашиваем."
@@ -408,20 +395,6 @@ async def cb_user_payment(
         else "Оплата по заявкам: бот снова будет спрашивать стоимость работ и материалов.",
         show_alert=True,
     )
-    if target.tg_id:
-        note = (
-            "ℹ️ Условия оплаты обновлены: <b>фиксированная ежемесячная</b>.\n"
-            "При завершении заявки укажите только выполненные работы и, "
-            "при необходимости, фото — стоимость вводить не нужно."
-            if target.fixed_payment
-            else "ℹ️ Условия оплаты обновлены: <b>оплата по каждой заявке</b>.\n"
-            "При завершении заявки снова потребуется указать стоимость работ "
-            "и материалов."
-        )
-        try:
-            await bot.send_message(target.tg_id, note)
-        except Exception:
-            pass
     await cb_user_card(call, AdminCB(act="user_card", id=target.id), session, user)
 
 
@@ -461,11 +434,7 @@ async def cb_user_brand_set(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     target = await session.get(User, callback_data.id)
-    target.brand_id = callback_data.id2 or None
-    if target.outlet_id:
-        outlet = await session.get(Outlet, target.outlet_id)
-        if outlet and outlet.brand_id != target.brand_id:
-            target.outlet_id = None
+    await user_ops.set_brand(session, target, user, callback_data.id2 or None)
     await session.commit()
     await call.answer("Бренд изменён")
     await cb_user_card(call, AdminCB(act="user_card", id=target.id), session, user)
@@ -512,10 +481,7 @@ async def cb_user_outlet_set(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     target = await session.get(User, callback_data.id)
-    target.outlet_id = callback_data.id2 or None
-    if target.outlet_id:
-        outlet = await session.get(Outlet, target.outlet_id)
-        target.brand_id = outlet.brand_id
+    await user_ops.set_outlet(session, target, user, callback_data.id2 or None)
     await session.commit()
     await call.answer("Точка изменена")
     await cb_user_card(call, AdminCB(act="user_card", id=target.id), session, user)
@@ -547,8 +513,7 @@ async def set_phone(
         return
     data = await state.get_data()
     target = await session.get(User, data["target_id"])
-    raw = message.text.strip()
-    target.phone = None if raw == "-" else (normalize_phone(raw) or raw)
+    await user_ops.set_phone(session, target, user, message.text)
     await session.commit()
     await state.clear()
     await message.answer(
@@ -592,24 +557,9 @@ async def cb_role_set(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     target = await session.get(User, callback_data.id)
-    new_role = callback_data.value
-    target.role_code = new_role
-    if target.status == UserStatus.PENDING:
-        target.status = UserStatus.ACTIVE
-        target.approved_at = utcnow()
-        target.approved_by_id = user.id
-    target.sync_flags()
+    warning = await user_ops.set_role(session, bot, target, user, callback_data.value)
     await session.commit()
-
-    has_directions = bool(
-        await session.scalar(
-            select(ExecutorAssignment.id).where(
-                ExecutorAssignment.user_id == target.id,
-                ExecutorAssignment.is_active.is_(True),
-            )
-        )
-    )
-    if new_role == RoleCode.EXECUTOR and not has_directions:
+    if warning == "needs_directions":
         await call.answer(
             "Роль изменена. Теперь выберите направления — без них заявки "
             "мастеру приходить не будут.",
@@ -617,7 +567,7 @@ async def cb_role_set(
         )
         await cb_exec_card(call, AdminCB(act="exec_card", id=target.id), session, user)
         return
-    if new_role != RoleCode.EXECUTOR and has_directions:
+    if warning == "stale_directions":
         await call.answer(
             "Роль изменена. Внимание: у человека остались направления мастера, "
             "но заявки по ним ему больше не пойдут.",
@@ -625,16 +575,6 @@ async def cb_role_set(
         )
     else:
         await call.answer("Роль изменена")
-    if target.tg_id:
-        try:
-            await bot.send_message(
-                target.tg_id,
-                f"ℹ️ Ваша роль изменена на: <b>{target.role_title}</b>.\n"
-                + texts.ROLE_INSTRUCTIONS.get(target.role_code, ""),
-                reply_markup=main_menu(target),
-            )
-        except Exception:
-            pass
     await cb_user_card(call, AdminCB(act="user_card", id=target.id), session, user)
 
 
@@ -862,17 +802,14 @@ async def cb_exec_save(
         brand_id = int(value[1:])
     elif value.startswith("o"):
         outlet_id = int(value[1:])
-        outlet = await session.get(Outlet, outlet_id)
-        brand_id = outlet.brand_id
-
-    session.add(
-        ExecutorAssignment(
-            user_id=callback_data.id,
-            category_id=callback_data.id2,
-            brand_id=brand_id,
-            outlet_id=outlet_id,
+    target = await session.get(User, callback_data.id)
+    try:
+        await user_ops.add_direction(
+            session, target, user, callback_data.id2, brand_id=brand_id, outlet_id=outlet_id
         )
-    )
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
     await session.commit()
     await call.answer("Направление добавлено")
     await cb_exec_card(call, AdminCB(act="exec_card", id=callback_data.id), session, user)
@@ -885,10 +822,9 @@ async def cb_exec_unassign(
     if not _require_admin(user):
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
-    assignment = await session.get(ExecutorAssignment, callback_data.id2)
-    if assignment is not None:
-        await session.delete(assignment)
-        await session.commit()
+    target = await session.get(User, callback_data.id)
+    await user_ops.remove_direction(session, target, user, callback_data.id2)
+    await session.commit()
     await call.answer("Направление удалено")
     await cb_exec_card(call, AdminCB(act="exec_card", id=callback_data.id), session, user)
 
@@ -935,34 +871,14 @@ async def exec_add_phone(message: types.Message, state: FSMContext) -> None:
 async def exec_add_username(
     message: types.Message, state: FSMContext, session: AsyncSession, user: Optional[User]
 ) -> None:
-    raw = message.text.strip().lstrip("@")
-    username = None if raw == "-" else raw
     data = await state.get_data()
-
-    if username:
-        exists = await session.scalar(
-            select(User).where(func.lower(User.username) == username.lower())
+    try:
+        executor = await catalog_ops.add_executor(
+            session, user, data["full_name"], data.get("phone") or "-", message.text
         )
-        if exists is not None:
-            await message.answer(
-                f"Пользователь @{esc(username)} уже есть в системе "
-                f"({esc(exists.full_name)}). Введите другой username или «-»."
-            )
-            return
-
-    executor = User(
-        full_name=data["full_name"],
-        last_name=data["full_name"],
-        phone=data.get("phone"),
-        username=username,
-        position_text="Мастер (заведён администратором)",
-        role_code=RoleCode.EXECUTOR,
-        status=UserStatus.ACTIVE,   # администратор завёл лично — доступ выдан
-        is_active=True,
-        is_registered=False,
-        approved_at=utcnow(),
-    )
-    session.add(executor)
+    except ActionError as exc:
+        await message.answer(f"{esc(str(exc))} Введите другой username или «-».")
+        return
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1065,7 +981,7 @@ async def cb_outlet_toggle(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     outlet = await session.get(Outlet, callback_data.id)
-    outlet.is_active = not outlet.is_active
+    await catalog_ops.toggle_outlet(session, user, outlet)
     await session.commit()
     await call.answer("Готово")
     await cb_outlet_card(call, callback_data, session, user)
@@ -1105,7 +1021,7 @@ async def cb_outlet_brand_set(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     outlet = await session.get(Outlet, callback_data.id)
-    outlet.brand_id = callback_data.id2
+    await catalog_ops.set_outlet_brand(session, user, outlet, callback_data.id2)
     await session.commit()
     await call.answer("Бренд изменён")
     await cb_outlet_card(call, AdminCB(act="outlet_card", id=outlet.id), session, user)
@@ -1134,13 +1050,11 @@ async def outlet_add_name(
         return
     data = await state.get_data()
     name = message.text.strip()
-    exists = await session.scalar(
-        select(Outlet).where(Outlet.brand_id == data["brand_id"], Outlet.name == name)
-    )
-    if exists:
-        await message.answer("Такая точка уже есть. Введите другое название.")
+    try:
+        await catalog_ops.add_outlet(session, user, data["brand_id"], name)
+    except ActionError as exc:
+        await message.answer(str(exc))
         return
-    session.add(Outlet(brand_id=data["brand_id"], name=name))
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1171,7 +1085,11 @@ async def outlet_rename(
         return
     data = await state.get_data()
     outlet = await session.get(Outlet, data["outlet_id"])
-    outlet.name = message.text.strip()
+    try:
+        await catalog_ops.rename_outlet(session, user, outlet, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1263,10 +1181,8 @@ async def cb_cat_toggle(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     cat = await session.get(Category, callback_data.id)
-    if callback_data.act == "cat_toggle":
-        cat.is_active = not cat.is_active
-    else:
-        cat.photo_required = not cat.photo_required
+    field = "is_active" if callback_data.act == "cat_toggle" else "photo_required"
+    await catalog_ops.toggle_category(session, user, cat, field)
     await session.commit()
     await call.answer("Готово")
     await cb_cat_card(call, AdminCB(act="cat_card", id=cat.id), session, user)
@@ -1297,7 +1213,11 @@ async def cat_rename(
         return
     data = await state.get_data()
     cat = await session.get(Category, data["category_id"])
-    cat.name = message.text.strip()
+    try:
+        await catalog_ops.rename_category(session, user, cat, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1335,15 +1255,12 @@ async def cat_add_emoji(
     message: types.Message, state: FSMContext, session: AsyncSession, user: Optional[User]
 ) -> None:
     data = await state.get_data()
-    emoji = message.text.strip()
-    if emoji == "-" or len(emoji) > 4:
-        emoji = "📦"
-    name = data["cat_name"]
-    code = f"custom_{abs(hash(name)) % 100000}"
-    max_sort = await session.scalar(select(func.max(Category.sort_order))) or 0
-    session.add(
-        Category(code=code, name=name, emoji=emoji, sort_order=max_sort + 10)
-    )
+    try:
+        category = await catalog_ops.add_category(session, user, data["cat_name"], message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
+    emoji, name = category.emoji, category.name
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1500,30 +1417,14 @@ async def cb_scope_save(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     target = await session.get(User, callback_data.id)
-    if callback_data.value == "outlet":
-        outlet = await session.get(Outlet, callback_data.id2)
-        scope_row = UserScope(
-            user_id=target.id, outlet_id=outlet.id, brand_id=outlet.brand_id,
-            created_by_id=user.id,
-        )
-        label = outlet.name
-    else:
-        brand = await session.get(Brand, callback_data.id2)
-        scope_row = UserScope(
-            user_id=target.id, brand_id=brand.id, created_by_id=user.id
-        )
-        label = f"{brand.name} (весь бренд)"
-    session.add(scope_row)
+    kind = "outlet_id" if callback_data.value == "outlet" else "brand_id"
+    try:
+        await user_ops.add_scope(session, bot, target, user, **{kind: callback_data.id2})
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
     await session.commit()
     await call.answer("Объект закреплён")
-    if target.tg_id:
-        try:
-            await bot.send_message(
-                target.tg_id,
-                f"ℹ️ Вам дополнительно открыт доступ к объекту: <b>{esc(label)}</b>.",
-            )
-        except Exception:
-            pass
     await cb_scope_card(call, AdminCB(act="scope_card", id=target.id), session, user)
 
 
@@ -1535,10 +1436,9 @@ async def cb_scope_del(
     if not _require_admin(user):
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
-    row = await session.get(UserScope, callback_data.id2)
-    if row is not None:
-        await session.delete(row)
-        await session.commit()
+    target = await session.get(User, callback_data.id)
+    await user_ops.remove_scope(session, target, user, callback_data.id2)
+    await session.commit()
     await call.answer("Доступ к объекту снят")
     await cb_scope_card(call, AdminCB(act="scope_card", id=callback_data.id), session, user)
 

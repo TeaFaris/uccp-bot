@@ -26,8 +26,10 @@ from ..db.models import (
     UserStatus,
 )
 from ..keyboards.common import cancel_kb, main_menu, BTN_CANCEL
+from ..services import user_ops
+from ..services.ops import ActionError
 from ..states import Approval
-from ..utils import esc, fmt_dt, utcnow
+from ..utils import esc, fmt_dt
 
 router = Router(name="approval")
 
@@ -428,65 +430,9 @@ async def _finish(
     target: User,
 ) -> None:
     """Последний шаг: выдаём доступ и уведомляем человека."""
-    target.status = UserStatus.ACTIVE
-    target.approved_at = utcnow()
-    target.approved_by_id = admin.id
-    target.reject_reason = None
-    target.sync_flags()
+    summary = await user_ops.finish_approval(session, bot, target, admin)
     await session.commit()
-
-    role = target.role_code
-    brand = await session.get(Brand, target.brand_id) if target.brand_id else None
-    outlet = await session.get(Outlet, target.outlet_id) if target.outlet_id else None
-
-    names: List[str] = []
-    if role == RoleCode.EXECUTOR:
-        for cat_id in await _selected_directions(session, target.id):
-            category = await session.get(Category, cat_id)
-            if category:
-                names.append(category.name)
-
-    scope_lines = {
-        RoleCode.STAFF: f"Объект: {outlet.name if outlet else '—'}",
-        RoleCode.OUTLET_ADMIN: f"Объект: {outlet.name if outlet else '—'}",
-        RoleCode.OPS_DIRECTOR: f"Бренд: {brand.name if brand else '—'}",
-        RoleCode.EXECUTOR: "Направления: " + (", ".join(names) if names else "—")
-        + (f"\nБренд: {brand.name}" if brand else "\nБренды и объекты: все"),
-        RoleCode.UCCP_STAFF: "Доступ: все обращения точек в УЦЦП",
-        RoleCode.ADMIN: "Доступ: полный",
-    }
-    scope = scope_lines.get(role, "")
-
-    role_label = target.role_title
-    if role == RoleCode.EXECUTOR and names:
-        role_label = f"Мастер — {names[0].lower()}" if len(names) == 1 else "Мастер"
-
-    if target.tg_id:
-        try:
-            await bot.send_message(
-                target.tg_id,
-                texts.APPROVED_NOTICE.format(
-                    role=esc(role_label),
-                    scope=esc(scope),
-                    hint=(
-                        "Теперь вы будете получать назначенные вам заявки."
-                        if role == RoleCode.EXECUTOR
-                        else "Рабочее меню открыто — можно создавать заявки."
-                    ),
-                ),
-                reply_markup=main_menu(target),
-            )
-            await bot.send_message(target.tg_id, texts.ROLE_INSTRUCTIONS.get(role, ""))
-        except Exception:
-            pass
-
-    warn = "" if target.tg_id else "\n\n⚠️ Пользователь ещё не активировал бота."
-    await call.message.edit_text(
-        f"✅ Регистрация <b>№{target.id}</b> подтверждена.\n\n"
-        f"{esc(target.full_name)}\n"
-        f"Роль: <b>{esc(role_label)}</b>\n{esc(scope)}{warn}",
-        reply_markup=_back_kb(),
-    )
+    await call.message.edit_text(summary, reply_markup=_back_kb())
 
 
 # --------------------------------------------------------------------------- #
@@ -526,22 +472,13 @@ async def reject_reason(
         return
     data = await state.get_data()
     target = await session.get(User, data["target_id"])
-    reason = message.text.strip()
-
-    target.status = UserStatus.REJECTED
-    target.reject_reason = reason
-    target.sync_flags()
+    try:
+        await user_ops.reject(session, bot, target, user, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
-
-    if target.tg_id:
-        try:
-            await bot.send_message(
-                target.tg_id,
-                texts.REJECTED_HINT.format(reason=f"Причина: <i>{esc(reason)}</i>"),
-            )
-        except Exception:
-            pass
     await message.answer(
         f"❌ Заявка <b>№{target.id}</b> отклонена. Пользователь уведомлён.",
         reply_markup=main_menu(user),

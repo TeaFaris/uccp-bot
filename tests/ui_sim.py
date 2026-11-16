@@ -879,6 +879,86 @@ async def main() -> None:
     check("Новая заявка" in answer, "И подсказывает, как оформить заявку заново")
     check("устарело" not in answer, "Без тупикового «сообщение устарело»")
 
+    # ---------------- админка в боте ----------------
+    print("\n=== Администрирование в боте ===")
+    from uccp_bot.callbacks import AdminCB
+    from uccp_bot.db.models import ExecutorAssignment, UserScope
+
+    async def admin_cb(**kw) -> None:
+        await admin.raw_callback(1, AdminCB(**kw).pack())
+
+    async with SessionMaker() as session:
+        mgr = await session.scalar(select(User).where(User.tg_id == 5002))
+        elec = await session.scalar(select(User).where(User.tg_id == 5003))
+        opera = await session.scalar(select(Outlet).where(Outlet.name == "Moose Opera"))
+        cat = await session.scalar(select(Category).where(Category.code == "electric"))
+        mgr_id, elec_id, opera_id, brand_id, cat_id = mgr.id, elec.id, opera.id, opera.brand_id, cat.id
+
+    OUT.clear()
+    await admin_cb(act="user_status", id=mgr_id, value=UserStatus.BLOCKED)
+    await admin_cb(act="user_status", id=mgr_id, value=UserStatus.ACTIVE)
+    await admin_cb(act="user_payment", id=elec_id)
+    await admin_cb(act="user_outlet_set", id=mgr_id, id2=opera_id)
+    await admin_cb(act="user_phone", id=mgr_id)
+    await admin.send("+992 900 11 22 33")
+    await admin_cb(act="scope_save", id=mgr_id, id2=opera_id, value="outlet")
+    await admin_cb(act="exec_save", id=elec_id, id2=cat_id, value=f"b{brand_id}")
+    async with SessionMaker() as session:
+        mgr = await session.get(User, mgr_id)
+        elec = await session.get(User, elec_id)
+        check(mgr.status == UserStatus.ACTIVE and mgr.outlet_id == opera_id,
+              "Статус и точка пользователя меняются из бота")
+        check(mgr.phone and "900" in mgr.phone, f"Телефон сохранён: {mgr.phone}")
+        check(elec.fixed_payment, "Фиксированная оплата включается из бота")
+        scope_row = await session.scalar(select(UserScope).where(UserScope.user_id == mgr_id))
+        direction = await session.scalar(select(ExecutorAssignment).where(
+            ExecutorAssignment.user_id == elec_id, ExecutorAssignment.brand_id == brand_id))
+        check(scope_row is not None and direction is not None,
+              "Объект и направление добавляются из бота")
+        scope_id, direction_id = scope_row.id, direction.id
+    await admin_cb(act="scope_del", id=mgr_id, id2=scope_id)
+    await admin_cb(act="exec_unassign", id=elec_id, id2=direction_id)
+    await admin_cb(act="user_payment", id=elec_id)
+    await admin_cb(act="role_set", id=mgr_id, value=RoleCode.OUTLET_ADMIN)
+
+    await admin_cb(act="outlet_add", id=brand_id)
+    await admin.send("Moose Тестовая")
+    async with SessionMaker() as session:
+        new_outlet = await session.scalar(select(Outlet).where(Outlet.name == "Moose Тестовая"))
+        check(new_outlet is not None, "Точка добавляется из бота")
+        new_outlet_id = new_outlet.id
+    await admin_cb(act="outlet_rename", id=new_outlet_id)
+    await admin.send("Moose Тест-2")
+    await admin_cb(act="outlet_toggle", id=new_outlet_id)
+    await admin_cb(act="cat_add")
+    await admin.send("Кондиционеры")
+    await admin.send("🌀")
+    async with SessionMaker() as session:
+        vent = await session.scalar(select(Category).where(Category.name == "Кондиционеры"))
+        check(vent is not None and vent.emoji == "🌀", "Категория добавляется из бота")
+        vent_id = vent.id
+    await admin_cb(act="cat_rename", id=vent_id)
+    await admin.send("Кондиционеры и сплит-системы")
+    await admin_cb(act="cat_photo", id=vent_id)
+    await admin_cb(act="exec_add")
+    await admin.send("Сантехник Али")
+    await admin.send("-")
+    await admin.send("@ali_fix")
+    async with SessionMaker() as session:
+        mgr = await session.get(User, mgr_id)
+        outlet = await session.get(Outlet, new_outlet_id)
+        vent = await session.get(Category, vent_id)
+        ali = await session.scalar(select(User).where(User.username == "ali_fix"))
+        check(mgr.role_code == RoleCode.OUTLET_ADMIN, "Роль меняется из бота")
+        check(outlet.name == "Moose Тест-2" and not outlet.is_active,
+              "Точка переименована и выключена из бота")
+        check(vent.name == "Кондиционеры и сплит-системы" and vent.photo_required,
+              "Категория переименована, фото обязательно")
+        check(ali is not None and ali.is_executor, "Мастер заводится из бота")
+        check(await session.scalar(select(UserScope).where(UserScope.user_id == mgr_id)) is None,
+              "Объект снимается из бота")
+    check(not any("Недостаточно прав" in a for a in OUT.alerts), "Админу хватает прав на всё")
+
     # ---------------- помощь ----------------
     print("\n=== Помощь ===")
     OUT.clear()
