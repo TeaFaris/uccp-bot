@@ -304,6 +304,54 @@ async def main() -> None:
         await client.get("/logout")
         await login(client, admin.id)
 
+        print("\n=== Справочники ===")
+        text = await (await client.get("/catalog")).text()
+        check("Точки" in text and "Категории" in text and "Мастера" in text,
+              "Страница справочников открывается")
+        check('href="/catalog"' in text, "Пункт «Справочники» в меню админа")
+
+        async def cat_act(act_name, **fields):
+            resp = await client.post(f"/catalog/do/{act_name}", data={"csrf": csrf(client), **fields})
+            return await resp.text()
+
+        await cat_act("outlet_add", brand_id=moose.id, name="Moose Панель")
+        async with SessionMaker() as session:
+            o = await session.scalar(select(Outlet).where(Outlet.name == "Moose Панель"))
+        check(o is not None and o.brand_id == moose.id, "Точка добавлена из панели")
+        page = await cat_act("outlet_add", brand_id=moose.id, name="Moose Панель")
+        check("уже есть" in page, "Дубль точки — понятная ошибка")
+        await cat_act("outlet_rename", outlet_id=o.id, name="Moose Панель-2")
+        await cat_act("outlet_brand", outlet_id=o.id, brand_id=hd.id)
+        await cat_act("outlet_toggle", outlet_id=o.id)
+        async with SessionMaker() as session:
+            o = await session.get(Outlet, o.id)
+        check(o.name == "Moose Панель-2" and o.brand_id == hd.id and not o.is_active,
+              "Точка переименована, перенесена и выключена из панели")
+
+        await cat_act("cat_add", name="Лифты", emoji="🛗")
+        async with SessionMaker() as session:
+            c = await session.scalar(select(Category).where(Category.name == "Лифты"))
+        check(c is not None and c.emoji == "🛗", "Категория добавлена из панели")
+        await cat_act("cat_rename", category_id=c.id, name="Лифты и подъёмники")
+        await cat_act("cat_toggle", category_id=c.id, field="photo_required")
+        async with SessionMaker() as session:
+            c = await session.get(Category, c.id)
+        check(c.name == "Лифты и подъёмники" and c.photo_required, "Категория изменена из панели")
+
+        await cat_act("exec_add", full_name="Мастер Из Панели", phone="-", username="panel_master")
+        async with SessionMaker() as session:
+            m = await session.scalar(select(User).where(User.username == "panel_master"))
+        check(m is not None and m.is_executor, "Мастер заведён из панели")
+        text = await (await client.get("/catalog")).text()
+        check(f'href="/users/{m.id}"' in text, "Мастер в списке со ссылкой на карточку")
+
+        await client.get("/logout")
+        await login(client, chief.id)
+        resp = await client.get("/catalog")
+        check(resp.status == 403, "Справочники — только главному администратору")
+        await client.get("/logout")
+        await login(client, admin.id)
+
         print("\n=== Перебор кода входа ===")
         await client.get("/logout")
         auth.GLOBAL_FAIL_LIMIT = 5

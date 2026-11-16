@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..db.models import (
     Brand, Category, ExecutorAssignment, Outlet, RoleCode, User, UserScope, UserStatus,
 )
-from ..services import user_ops
+from ..services import catalog_ops, user_ops
 from ..services.ops import ActionError
 from ..utils import esc, fmt_dt
 from . import auth, views
@@ -402,3 +402,205 @@ async def user_do(request: web.Request) -> web.Response:
             return _back(back, str(exc), ok=False)
         await session.commit()
     return _back(back, message)
+
+
+# --------------------------------------------------------------------------- #
+# Справочники: точки, категории, мастера
+# --------------------------------------------------------------------------- #
+@routes.get("/catalog")
+async def catalog_page(request: web.Request) -> web.Response:
+    user = await _manager(request)
+    async with _maker(request)() as session:
+        brands = list((await session.scalars(select(Brand).order_by(Brand.sort_order))).all())
+        outlets = list((await session.scalars(
+            select(Outlet).order_by(Outlet.brand_id, Outlet.sort_order, Outlet.name)
+        )).all())
+        categories = list((await session.scalars(select(Category).order_by(Category.sort_order))).all())
+        executors = list((await session.scalars(
+            select(User).where(User.role_code == RoleCode.EXECUTOR).order_by(User.full_name)
+        )).all())
+        dir_counts = dict((await session.execute(
+            select(ExecutorAssignment.user_id, func.count()).group_by(ExecutorAssignment.user_id)
+        )).all())
+
+    csrf = auth.csrf_token(request)
+    url = "/catalog/do"
+    brand_opts = [(b.id, b.name) for b in brands]
+
+    def rename_form(action: str, id_field: str, obj_id: int, value: str) -> str:
+        return (
+            f'<form class="inline" method="post" action="{url}/{action}">{views.csrf_input(csrf)}'
+            f'<input type="hidden" name="{id_field}" value="{obj_id}">'
+            f'<input name="name" value="{esc(value)}" required style="width:200px">'
+            "<button type=submit>Переименовать</button></form>"
+        )
+
+    outlet_rows = [
+        [
+            rename_form("outlet_rename", "outlet_id", o.id, o.name),
+            f'<form class="inline" method="post" action="{url}/outlet_brand">{views.csrf_input(csrf)}'
+            f'<input type="hidden" name="outlet_id" value="{o.id}">'
+            f'<select name="brand_id">{views.options_html(brand_opts, o.brand_id)}</select>'
+            "<button type=submit>Сменить</button></form>",
+            views.tag("работает", "green") if o.is_active else views.tag("выключена", "red"),
+            views.inline_button(f"{url}/outlet_toggle", "выключить" if o.is_active else "включить",
+                                csrf, [("outlet_id", o.id)]),
+        ]
+        for o in outlets
+    ]
+    category_rows = [
+        [
+            esc(c.emoji or ""),
+            rename_form("cat_rename", "category_id", c.id, c.name),
+            views.tag("действует", "green") if c.is_active else views.tag("выключена", "red"),
+            ("фото обязательно" if c.photo_required else "фото по желанию"),
+            views.inline_button(f"{url}/cat_toggle", "выключить" if c.is_active else "включить",
+                                csrf, [("category_id", c.id), ("field", "is_active")])
+            + " "
+            + views.inline_button(f"{url}/cat_toggle",
+                                  "фото по желанию" if c.photo_required else "фото обязательно",
+                                  csrf, [("category_id", c.id), ("field", "photo_required")]),
+        ]
+        for c in categories
+    ]
+    executor_rows = [
+        [
+            f'<a href="/users/{e.id}">{esc(e.full_name)}</a>',
+            esc(UserStatus.TITLES.get(e.status, e.status)),
+            str(dir_counts.get(e.id, 0)),
+            esc(e.phone or "—"),
+            esc(("@" + e.username) if e.username else "—"),
+            "да" if e.tg_id else "нет",
+        ]
+        for e in executors
+    ]
+    body = (
+        "<h1>Справочники</h1>"
+        "<h2>Точки</h2>"
+        + views.table(["Название", "Бренд", "Статус", ""], outlet_rows)
+        + '<div class="actions">' + views.action_box(
+            f"{url}/outlet_add", "Добавить точку",
+            f'<select name="brand_id">{views.options_html(brand_opts)}</select>'
+            '<input name="name" required placeholder="Название точки">',
+            "🏬 Добавить", csrf) + "</div>"
+        + "<h2>Категории</h2>"
+        + views.table(["", "Название", "Статус", "Фото", ""], category_rows)
+        + '<div class="actions">' + views.action_box(
+            f"{url}/cat_add", "Добавить категорию",
+            '<input name="name" required placeholder="Название категории">'
+            '<input name="emoji" maxlength="4" placeholder="Эмодзи (необязательно)">'
+            '<span class="muted">После добавления назначьте мастеров на это направление.</span>',
+            "📦 Добавить", csrf) + "</div>"
+        + "<h2>Мастера</h2>"
+        + views.table(["Ф.И.О.", "Доступ", "Направлений", "Телефон", "Telegram", "Бот активирован"],
+                      executor_rows)
+        + '<div class="actions">' + views.action_box(
+            f"{url}/exec_add", "Добавить мастера",
+            '<input name="full_name" required placeholder="Ф.И.О.">'
+            '<input name="phone" placeholder="Телефон (необязательно)">'
+            '<input name="username" placeholder="@username в Telegram (необязательно)">'
+            '<span class="muted">С username бот узнает мастера, когда тот нажмёт /start.</span>',
+            "👷 Добавить", csrf) + "</div>"
+    )
+    return web.Response(text=views.page("Справочники", body, user, "catalog"),
+                        content_type="text/html")
+
+
+CatalogAction = Callable[[AsyncSession, User, "MultiDictProxy"], Awaitable[str]]
+CATALOG_ACTIONS: Dict[str, CatalogAction] = {}
+
+
+def catalog_action(name: str):
+    def register(func: CatalogAction) -> CatalogAction:
+        CATALOG_ACTIONS[name] = func
+        return func
+    return register
+
+
+async def _get_or_fail(session: AsyncSession, model, raw, what: str):
+    obj = await session.get(model, _opt_int(raw)) if _opt_int(raw) else None
+    if obj is None:
+        raise ActionError(f"{what} не найдена — обновите страницу.")
+    return obj
+
+
+@catalog_action("outlet_add")
+async def _outlet_add(session, actor, form) -> str:
+    brand_id = _opt_int(form.get("brand_id"))
+    if brand_id is None or await session.get(Brand, brand_id) is None:
+        raise ActionError("Выберите бренд.")
+    outlet = await catalog_ops.add_outlet(session, actor, brand_id, str(form.get("name", "")))
+    return f"Точка «{outlet.name}» добавлена."
+
+
+@catalog_action("outlet_rename")
+async def _outlet_rename(session, actor, form) -> str:
+    outlet = await _get_or_fail(session, Outlet, form.get("outlet_id"), "Точка")
+    await catalog_ops.rename_outlet(session, actor, outlet, str(form.get("name", "")))
+    return f"Точка переименована: «{outlet.name}»."
+
+
+@catalog_action("outlet_brand")
+async def _outlet_brand(session, actor, form) -> str:
+    outlet = await _get_or_fail(session, Outlet, form.get("outlet_id"), "Точка")
+    brand_id = _opt_int(form.get("brand_id"))
+    if brand_id is None or await session.get(Brand, brand_id) is None:
+        raise ActionError("Выберите бренд.")
+    await catalog_ops.set_outlet_brand(session, actor, outlet, brand_id)
+    return f"Точка «{outlet.name}» перенесена в другой бренд."
+
+
+@catalog_action("outlet_toggle")
+async def _outlet_toggle(session, actor, form) -> str:
+    outlet = await _get_or_fail(session, Outlet, form.get("outlet_id"), "Точка")
+    await catalog_ops.toggle_outlet(session, actor, outlet)
+    return f"Точка «{outlet.name}» {'включена' if outlet.is_active else 'выключена'}."
+
+
+@catalog_action("cat_add")
+async def _cat_add(session, actor, form) -> str:
+    category = await catalog_ops.add_category(
+        session, actor, str(form.get("name", "")), str(form.get("emoji", ""))
+    )
+    return f"Категория «{category.label}» добавлена. Назначьте мастеров на это направление."
+
+
+@catalog_action("cat_rename")
+async def _cat_rename(session, actor, form) -> str:
+    category = await _get_or_fail(session, Category, form.get("category_id"), "Категория")
+    await catalog_ops.rename_category(session, actor, category, str(form.get("name", "")))
+    return f"Категория переименована: «{category.label}»."
+
+
+@catalog_action("cat_toggle")
+async def _cat_toggle(session, actor, form) -> str:
+    category = await _get_or_fail(session, Category, form.get("category_id"), "Категория")
+    await catalog_ops.toggle_category(session, actor, category, str(form.get("field", "")))
+    return f"Категория «{category.label}» обновлена."
+
+
+@catalog_action("exec_add")
+async def _exec_add(session, actor, form) -> str:
+    executor = await catalog_ops.add_executor(
+        session, actor, str(form.get("full_name", "")), str(form.get("phone", "")),
+        str(form.get("username", "")),
+    )
+    return (f"Мастер «{executor.full_name}» добавлен. Откройте его карточку и назначьте "
+            "направления.")
+
+
+@routes.post("/catalog/do/{action}")
+async def catalog_do(request: web.Request) -> web.Response:
+    user, form = await _admin_post(request)
+    action = CATALOG_ACTIONS.get(request.match_info["action"])
+    if action is None:
+        raise web.HTTPNotFound(text="Неизвестное действие")
+    async with _maker(request)() as session:
+        actor = await session.get(User, user.id)
+        try:
+            message = await action(session, actor, form)
+        except ActionError as exc:
+            await session.rollback()
+            return _back("/catalog", str(exc), ok=False)
+        await session.commit()
+    return _back("/catalog", message)
