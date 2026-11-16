@@ -130,6 +130,12 @@ async def add_comment(
     session: AsyncSession, bot: Bot, request: Request, actor: User, text: str
 ) -> None:
     require(actor is not None and actor.is_approved and not actor.is_viewer)
+    # как в боте: кнопка комментария есть только у заявки в работе
+    require(
+        request.status in Status.OPEN,
+        f"Заявка {request.number} уже в статусе «{Status.title(request.status)}» — "
+        "действие недоступно.",
+    )
     text = (text or "").strip()
     require(bool(text), "Напишите текст комментария.")
     session.add(Comment(request_id=request.id, user_id=actor.id, text=text))

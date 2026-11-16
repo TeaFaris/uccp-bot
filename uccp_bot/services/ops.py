@@ -5,7 +5,25 @@
 """
 from __future__ import annotations
 
+import asyncio
+import weakref
+
 from .. import texts
+
+# Бот и панель работают в одном процессе. Действие над одним объектом
+# (заявкой, пользователем, справочником) выполняется строго по очереди:
+# двойной клик или одновременное нажатие в боте и в панели не применят его дважды.
+_locks: "weakref.WeakValueDictionary[tuple, asyncio.Lock]" = weakref.WeakValueDictionary()
+
+
+def entity_lock(kind: str, entity_id: object = 0) -> asyncio.Lock:
+    """Блокировка на объект; держать от загрузки объекта до коммита."""
+    key = (kind, entity_id)
+    lock = _locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[key] = lock
+    return lock
 
 
 class ActionError(Exception):

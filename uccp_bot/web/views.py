@@ -4,7 +4,17 @@ from __future__ import annotations
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from ..db.models import CostStatus, OrgStatus, Priority, Status, User
-from ..utils import esc, fmt_dt, fmt_money
+import html
+
+from ..utils import fmt_dt, fmt_money
+
+
+def esc(value) -> str:
+    """Экранирование для HTML панели, включая кавычки — значения стоят и в атрибутах.
+
+    (utils.esc рассчитан на Telegram и кавычки не трогает.)
+    """
+    return html.escape("" if value is None else str(value), quote=True)
 
 CSS = """
 *{box-sizing:border-box}

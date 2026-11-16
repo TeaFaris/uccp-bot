@@ -109,11 +109,13 @@ async def approve(
 ) -> str:
     """Одобрение регистрации за один шаг (панель). Правила — как у мастера в боте."""
     _require_manager(actor)
-    require(target.status != UserStatus.ACTIVE, "Регистрация уже подтверждена.")
+    # как в боте: одобряется только ожидающая заявка
+    require(target.status == UserStatus.PENDING,
+            "Одобрить можно только заявку, которая ждёт подтверждения.")
     require(role in RoleCode.ALL, "Выберите роль.")
     category_ids = [int(c) for c in category_ids]
 
-    if role in (RoleCode.ADMIN, RoleCode.UCCP_STAFF):
+    if role in (RoleCode.ADMIN, RoleCode.UCCP_STAFF, RoleCode.OPS_CHIEF):
         brand_id = outlet_id = None
     elif role in (RoleCode.OPS_DIRECTOR, RoleCode.EXECUTOR):
         outlet_id = None
@@ -121,8 +123,19 @@ async def approve(
         outlet = await session.get(Outlet, outlet_id)
         require(outlet is not None, "Точка не найдена.")
         brand_id = outlet.brand_id
+    if brand_id:
+        require(await session.get(Brand, brand_id) is not None, "Бренд не найден.")
+    # те же обязательные шаги, что у мастера одобрения в боте
+    if role in (RoleCode.STAFF, RoleCode.OUTLET_ADMIN):
+        require(bool(outlet_id), "Для этой роли выберите точку.")
+    if role == RoleCode.OPS_DIRECTOR:
+        require(bool(brand_id), "Для операционного директора выберите бренд.")
     if role == RoleCode.EXECUTOR:
         require(bool(category_ids), "Отметьте хотя бы одно направление мастера.")
+        for cat_id in category_ids:
+            category = await session.get(Category, cat_id)
+            require(category is not None and category.is_active,
+                    "Направление не найдено — обновите страницу.")
 
     target.role_code = role
     target.brand_id = brand_id or None

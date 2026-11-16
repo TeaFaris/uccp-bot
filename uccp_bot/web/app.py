@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
-import mimetypes
+from urllib.parse import urlencode
 from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Optional, Tuple
 
@@ -40,15 +40,29 @@ from ..services import org as org_service
 from ..services import reports as reports_service
 from ..services import scope
 from ..services.cards import REQUEST_LOAD_OPTIONS, load_request
-from ..services.ops import ActionError
+from ..services.ops import ActionError, entity_lock
 from ..services.history import ACTION_TITLES
 from ..utils import (
-    esc, fmt_dt, fmt_money, local_from_utc, parse_amount, parse_date, utc_from_local,
+    fmt_dt, fmt_money, local_from_utc, parse_amount, parse_date, utc_from_local,
 )
 from . import auth, views
+from .views import esc
 
 PAGE_SIZE = 25
 routes = web.RouteTableDef()
+
+# Панель обходится без скриптов: запрещаем их совсем, а также встраивание
+# в чужие страницы и отправку форм на чужие адреса.
+PAGE_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; "
+    "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+)
+
+
+def _page_query(query, page: int) -> str:
+    """Строка запроса для ссылок постраничного вывода, безопасная для href."""
+    params = [(k, v) for k, v in query.items() if k != "page"] + [("page", str(page))]
+    return esc(urlencode(params))
 
 
 def _maker(request: web.Request) -> async_sessionmaker:
@@ -105,6 +119,9 @@ async def panel_middleware(request: web.Request, handler):
         response = await handler(request)
     finally:
         history.SOURCE.reset(token)
+    response.headers.setdefault("Content-Security-Policy", PAGE_CSP)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
     flash = _read_flash(request.cookies.get(FLASH_COOKIE))
     if (flash and isinstance(response, web.Response) and response.text
             and response.content_type == "text/html"):
@@ -304,10 +321,9 @@ async def requests_list(request: web.Request) -> web.Response:
 
     pager = ""
     if page_no or has_next:
-        base = "&".join(f"{k}={esc(v)}" for k, v in q.items() if k != "page")
-        prev_link = (f'<a class="tag" href="/requests?{base}&page={page_no - 1}">← назад</a>'
+        prev_link = (f'<a class="tag" href="/requests?{_page_query(q, page_no - 1)}">← назад</a>'
                      if page_no else "")
-        next_link = (f'<a class="tag" href="/requests?{base}&page={page_no + 1}">вперёд →</a>'
+        next_link = (f'<a class="tag" href="/requests?{_page_query(q, page_no + 1)}">вперёд →</a>'
                      if has_next else "")
         pager = f'<div class="pager">{prev_link}{next_link}' \
                 f'<span class="muted">страница {page_no + 1}</span></div>'
@@ -582,16 +598,19 @@ async def media_file(request: web.Request) -> web.Response:
             data = (await bot.download_file(info.file_path)).getvalue()
         except Exception:
             raise web.HTTPNotFound(text=MEDIA_TOO_BIG)
-        content_type = (
-            MEDIA_TYPES.get(media_type)
-            or mimetypes.guess_type(info.file_path or "")[0]
-            or "application/octet-stream"
-        )
+        # в панели открываются только фото и видео; любой другой файл (в т.ч.
+        # .html/.svg от пользователя) — только на скачивание, чтобы он не мог
+        # выполнить скрипт от имени панели
+        content_type = MEDIA_TYPES.get(media_type, "application/octet-stream")
         _media_cache_put(file_id, data, content_type)
-    return web.Response(
-        body=data, content_type=content_type,
-        headers={"Cache-Control": "private, max-age=86400"},
-    )
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+    }
+    if content_type == "application/octet-stream":
+        headers["Content-Disposition"] = f'attachment; filename="file-{aid}"'
+    return web.Response(body=data, content_type=content_type, headers=headers)
 
 
 RequestAction = Callable[[web.Request, AsyncSession, Request, User, dict], Awaitable[str]]
@@ -691,12 +710,19 @@ async def request_action(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text="Неизвестное действие")
     rid = int(request.match_info["rid"])
     back = f"/requests/{rid}"
-    async with _maker(request)() as session:
+    # загрузка — внутри блокировки: второй клик увидит уже новый статус
+    async with entity_lock("request", rid), _maker(request)() as session:
         req = await load_request(session, rid)
         if req is None:
             raise web.HTTPNotFound(text="Заявка не найдена")
         actor = await session.get(User, user.id)
         try:
+            # принимаем только то, что сейчас показано в карточке
+            if request.match_info["action"] not in request_ops.available_actions(req, actor):
+                raise ActionError(
+                    f"Заявка {req.number} в статусе «{Status.title(req.status)}» — "
+                    "это действие сейчас недоступно. Обновите карточку."
+                )
             message = await action(request, session, req, actor, form)
         except ActionError as exc:
             await session.rollback()
@@ -759,11 +785,10 @@ async def org_list(request: web.Request) -> web.Response:
     ]
     pager = ""
     if page_no or has_next:
-        base = "&".join(f"{k}={esc(v)}" for k, v in q.items() if k != "page")
         pager = '<div class="pager">' + (
-            f'<a class="tag" href="/org?{base}&page={page_no - 1}">← назад</a>' if page_no else ""
+            f'<a class="tag" href="/org?{_page_query(q, page_no - 1)}">← назад</a>' if page_no else ""
         ) + (
-            f'<a class="tag" href="/org?{base}&page={page_no + 1}">вперёд →</a>' if has_next else ""
+            f'<a class="tag" href="/org?{_page_query(q, page_no + 1)}">вперёд →</a>' if has_next else ""
         ) + "</div>"
 
     body = (

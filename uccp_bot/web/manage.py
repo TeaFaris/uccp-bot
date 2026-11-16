@@ -17,9 +17,10 @@ from ..db.models import (
     Brand, Category, ExecutorAssignment, Outlet, RoleCode, User, UserScope, UserStatus,
 )
 from ..services import catalog_ops, user_ops
-from ..services.ops import ActionError
-from ..utils import esc, fmt_dt
+from ..services.ops import ActionError, entity_lock
+from ..utils import fmt_dt
 from . import auth, views
+from .views import esc
 from .app import _admin_post, _back, _bot, _guard, _maker
 
 routes = web.RouteTableDef()
@@ -191,7 +192,7 @@ async def user_card(request: web.Request) -> web.Response:
     ]
 
     blocks: List[str] = []
-    if target.status in (UserStatus.PENDING, UserStatus.REJECTED):
+    if target.status == UserStatus.PENDING:
         checks = "".join(
             f'<label><input type="checkbox" name="category_ids" value="{c.id}"> {esc(c.label)}</label>'
             for c in categories
@@ -201,7 +202,8 @@ async def user_card(request: web.Request) -> web.Response:
             f'<select name="role">{views.options_html(role_opts, target.role_code)}</select>'
             f'<select name="brand_id">{views.options_html(brand_opts, target.brand_id or "")}</select>'
             f'<select name="outlet_id">{views.options_html(outlet_opts, target.outlet_id or "")}</select>'
-            '<span class="muted">Направления — только для мастера (минимум одно):</span>'
+            '<span class="muted">Сотруднику и админу точки — точка, опердиректору — бренд, '
+            'мастеру — направления (минимум одно).</span>'
             f'<div class="checks">{checks}</div>',
             "✅ Одобрить",
         ))
@@ -390,7 +392,7 @@ async def user_do(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text="Неизвестное действие")
     uid = int(request.match_info["uid"])
     back = f"/users/{uid}"
-    async with _maker(request)() as session:
+    async with entity_lock("user", uid), _maker(request)() as session:
         target = await session.get(User, uid)
         if target is None:
             raise web.HTTPNotFound(text="Пользователь не найден")
@@ -595,7 +597,7 @@ async def catalog_do(request: web.Request) -> web.Response:
     action = CATALOG_ACTIONS.get(request.match_info["action"])
     if action is None:
         raise web.HTTPNotFound(text="Неизвестное действие")
-    async with _maker(request)() as session:
+    async with entity_lock("catalog"), _maker(request)() as session:
         actor = await session.get(User, user.id)
         try:
             message = await action(session, actor, form)

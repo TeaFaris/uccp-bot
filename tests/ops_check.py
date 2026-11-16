@@ -184,6 +184,8 @@ async def request_ops_checks(bot: FakeBot) -> None:
               "С отменённой заявкой действия запрещены")
         check(request_ops.available_actions(req, admin) == set(),
               "У отменённой заявки нет действий")
+        check(await refused(request_ops.add_comment(session, bot, req, admin, "Поздно")),
+              "Комментарий к закрытой заявке не принимается")
 
 
 async def user_ops_checks(bot: FakeBot) -> None:
@@ -203,6 +205,15 @@ async def user_ops_checks(bot: FakeBot) -> None:
         check(await refused(user_ops.approve(
             session, bot, pending, admin, RoleCode.EXECUTOR, None, None, [])),
               "Мастер без направлений не одобряется")
+        check(await refused(user_ops.approve(
+            session, bot, pending, admin, RoleCode.OUTLET_ADMIN, moose.id, None, [])),
+              "Админ точки без точки не одобряется (как в боте)")
+        check(await refused(user_ops.approve(
+            session, bot, pending, admin, RoleCode.OPS_DIRECTOR, None, None, [])),
+              "Опердиректор без бренда не одобряется (как в боте)")
+        check(await refused(user_ops.approve(
+            session, bot, pending, admin, RoleCode.EXECUTOR, moose.id, None, [999999])),
+              "Несуществующее направление — понятный отказ, без падения")
         bot.clear()
         summary = await user_ops.approve(
             session, bot, pending, admin, RoleCode.EXECUTOR, moose.id, None, [electric.id])
@@ -264,6 +275,9 @@ async def user_ops_checks(bot: FakeBot) -> None:
               "Отклонение без причины не принимается")
         await user_ops.reject(session, bot, newcomer, admin, "Нет такого сотрудника")
         check(newcomer.status == UserStatus.REJECTED and bot.to(8), "Регистрация отклонена, человек уведомлён")
+        check(await refused(user_ops.approve(
+            session, bot, newcomer, admin, RoleCode.STAFF, moose.id, opera.id, [])),
+              "Отклонённую заявку одобрить нельзя (как в боте)")
         await session.commit()
 
 

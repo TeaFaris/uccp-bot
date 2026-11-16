@@ -22,7 +22,12 @@ class FakeBot:
         self.sent: List[Tuple[int, str]] = []
         self.files = {}          # file_id -> (bytes, file_size)
 
+    delay = 0.0              # имитация медленного Telegram
+
     async def send_message(self, chat_id, text, reply_markup=None, **kwargs):
+        if self.delay:
+            import asyncio
+            await asyncio.sleep(self.delay)
         self.sent.append((chat_id, text))
 
     async def send_photo(self, chat_id, *args, **kwargs):
@@ -43,17 +48,19 @@ class FakeBot:
         self.get_file_calls += 1
         if file_id not in self.files:
             raise RuntimeError("Bad Request: file is too big")
-        data, size = self.files[file_id]
+        data, size, *rest = self.files[file_id]
+        path = rest[0] if rest else f"photos/{file_id}.jpg"
 
         class _File:
-            file_path = f"photos/{file_id}.jpg"
+            file_path = path
             file_size = size
+        self._paths = getattr(self, "_paths", {})
+        self._paths[path] = data
         return _File()
 
     async def download_file(self, file_path, destination=None):
         import io
-        file_id = file_path.split("/")[-1].split(".")[0]
-        return io.BytesIO(self.files[file_id][0])
+        return io.BytesIO(self._paths[file_path])
 
     def to(self, chat_id: int) -> List[str]:
         return [text for cid, text in self.sent if cid == chat_id]

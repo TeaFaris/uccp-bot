@@ -107,14 +107,20 @@ async def main() -> None:
         r_open = await add(opera, staff, status=Status.NEW)
         photo = Attachment(request_id=r_moose.id, file_id="PH1", media_type="photo", stage="after")
         big = Attachment(request_id=r_moose.id, file_id="BIG", media_type="video", stage="after")
-        session.add_all([photo, big])
+        doc = Attachment(request_id=r_moose.id, file_id="DOC1", media_type="document", stage="before")
+        session.add_all([photo, big, doc])
+        r_done = await add(opera, staff, cost=300, status=Status.DONE)
+        r_done.cost_status = CostStatus.PENDING
         await session.commit()
-        media = {"photo": photo.id, "big": big.id}
+        media = {"photo": photo.id, "big": big.id, "doc": doc.id}
+        done_id = r_done.id
         moose_no, hd_no = r_moose.number, r_hd.number
         ids = {"moose": r_moose.id, "hd": r_hd.id, "open": r_open.id}
 
+    ids["done"] = done_id
     bot = FakeBot()
     bot.files["PH1"] = (b"\xff\xd8\xff-jpeg-bytes", 18)
+    bot.files["DOC1"] = (b"<script>alert(1)</script>", 25, "documents/evil.html")
     app = build_app(SessionMaker, bot)
     async with TestClient(TestServer(app)) as client:
         print("=== Вход ===")
@@ -180,6 +186,23 @@ async def main() -> None:
               "Файл больше 20 МБ — «смотреть в Telegram»")
         resp = await client.get("/media/999999")
         check(resp.status == 404, "Несуществующий файл — 404")
+        resp = await client.get(f"/media/{media['doc']}")
+        check(resp.headers.get("Content-Type", "").startswith("application/octet-stream")
+              and "attachment" in resp.headers.get("Content-Disposition", ""),
+              "Документ (в т.ч. .html) отдаётся только на скачивание, не открывается в панели")
+        check(resp.headers.get("X-Content-Type-Options") == "nosniff"
+              and "sandbox" in resp.headers.get("Content-Security-Policy", ""),
+              "Файлы отдаются с nosniff и песочницей CSP")
+
+        print("\n=== Экранирование ===")
+        resp = await client.get('/requests?search=" autofocus onfocus="alert(1)')
+        text = await resp.text()
+        check('onfocus="alert(1)"' not in text, "Кавычки из поиска экранируются в атрибуте")
+        resp = await client.get('/requests?search=x&page=1&z"><b>=1')
+        check('"><b>' not in await resp.text(), "Ссылки постраничного вывода экранируются")
+        csp = resp.headers.get("Content-Security-Policy", "")
+        check("default-src 'none'" in csp and "frame-ancestors 'none'" in csp,
+              "Страницы панели запрещают скрипты и встраивание (CSP)")
 
         print("\n=== Действия с заявкой из панели ===")
         open_url = f"/requests/{ids['open']}"
@@ -225,6 +248,24 @@ async def main() -> None:
         check(req.status == Status.CANCELLED, "Заявка отменена из панели")
         page = await act("assign", executor_id=str(master2.id))
         check("недоступно" in page, "Действие над отменённой заявкой — понятный отказ")
+        page = await act("comment", text="Комментарий к отменённой")
+        check("недоступно" in page, "Комментарий к отменённой заявке — понятный отказ")
+
+        print("\n=== Двойная отправка формы ===")
+        bot.clear()
+        bot.delay = 0.2
+        done_url = f"/requests/{ids['done']}/do/confirm"
+        token = csrf(client)
+        r1, r2 = await asyncio.gather(
+            client.post(done_url, data={"csrf": token}),
+            client.post(done_url, data={"csrf": token}),
+        )
+        bot.delay = 0.0
+        async with SessionMaker() as session:
+            closes = (await session.scalars(select(RequestStatusHistory.action).where(
+                RequestStatusHistory.request_id == ids["done"],
+                RequestStatusHistory.action == "closed"))).all()
+        check(len(closes) == 1, f"Двойной клик закрывает заявку один раз (закрытий: {len(closes)})")
 
         await client.get("/logout")
         await login(client, chief.id)
@@ -263,6 +304,9 @@ async def main() -> None:
 
         await user_act(newbie.id, "role", role=RoleCode.STAFF)
         page = await user_act(newbie.id, "outlet", outlet_id=opera.id)
+        await user_act(newbie.id, "phone", phone='"><b>x')
+        card = await (await client.get(f"/users/{newbie.id}")).text()
+        check('"><b>x' not in card, "Телефон с кавычками экранируется в поле формы")
         await user_act(newbie.id, "phone", phone="+992 900 00 00 01")
         async with SessionMaker() as session:
             u = await session.get(User, newbie.id)
