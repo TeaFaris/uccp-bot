@@ -11,6 +11,8 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+import mimetypes
+from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Optional, Tuple
 
 from aiohttp import web
@@ -19,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..config import config
 from ..db.models import (
+    Attachment,
     Brand,
     Category,
     CostStatus,
@@ -386,8 +389,7 @@ async def request_card(request: web.Request) -> web.Response:
         ("Комментарий исполнителя", esc(req.executor_comment or "")),
         ("Комментарий менеджера", esc(req.manager_comment or "")),
         ("Причина возврата", esc(req.return_reason or "")),
-        ("Фото и файлы", f"{len(req.attachments)} шт. — смотреть в Telegram"
-         if req.attachments else "нет"),
+        ("Фото и файлы", f"{len(req.attachments)} шт. — ниже" if req.attachments else "нет"),
     ]
 
     timeline = "".join(
@@ -403,6 +405,7 @@ async def request_card(request: web.Request) -> web.Response:
         f'<h1>Заявка {esc(req.number)}</h1>'
         f'<p><a href="/requests">← ко всем заявкам</a></p>'
         + views.definition_list(pairs)
+        + _media_html(req.attachments)
         + actions_html
         + "<h2>История действий</h2>"
         + f'<div class="timeline">{timeline}</div>'
@@ -506,6 +509,94 @@ def _form_amount(form: dict, name: str) -> float:
 
 def _bot(request: web.Request):
     return request.app["bot"]
+
+
+# --------------------------------------------------------------------------- #
+# Фото и видео заявки — скачиваются через бота
+# --------------------------------------------------------------------------- #
+MEDIA_STAGES = (("before", "При создании"), ("after", "Результат работы"))
+MEDIA_TYPES = {"photo": "image/jpeg", "video": "video/mp4"}
+MEDIA_CACHE_LIMIT = 100 * 1024 * 1024       # не больше 100 МБ файлов в памяти
+MEDIA_TOO_BIG = (
+    "Файл недоступен для просмотра в браузере: Telegram отдаёт ботам файлы "
+    "до 20 МБ. Посмотреть его можно в Telegram — кнопка «📎 Файлы» в карточке заявки."
+)
+_media_cache: "OrderedDict[str, Tuple[bytes, str]]" = OrderedDict()
+
+
+def _media_cache_put(file_id: str, data: bytes, content_type: str) -> None:
+    if len(data) > MEDIA_CACHE_LIMIT // 4:
+        return
+    _media_cache[file_id] = (data, content_type)
+    while sum(len(d) for d, _ in _media_cache.values()) > MEDIA_CACHE_LIMIT:
+        _media_cache.popitem(last=False)
+
+
+def _media_html(attachments) -> str:
+    if not attachments:
+        return ""
+    out = ["<h2>Фото и файлы</h2>"]
+    for stage, title in MEDIA_STAGES:
+        items = [a for a in attachments if a.stage == stage]
+        if not items:
+            continue
+        parts = []
+        for number, att in enumerate(items, 1):
+            url = f"/media/{att.id}"
+            if att.media_type == "photo":
+                parts.append(
+                    f'<a href="{url}" target="_blank"><img src="{url}" loading="lazy" '
+                    f'alt="Фото {number}: не открылось — смотреть в Telegram"></a>'
+                )
+            else:
+                label = "🎬 Видео" if att.media_type == "video" else "📄 Файл"
+                parts.append(f'<a href="{url}" target="_blank">{label} {number}</a>')
+        out.append(f'<h3>{esc(title)}</h3><div class="media">{"".join(parts)}</div>')
+    out.append('<p class="muted">Файлы больше 20 МБ браузеру недоступны — '
+               "их можно посмотреть в Telegram.</p>")
+    return "".join(out)
+
+
+@routes.get("/media/{aid}")
+async def media_file(request: web.Request) -> web.Response:
+    """Файл заявки — тем, кому видна сама заявка."""
+    user = await _guard(request)
+    try:
+        aid = int(request.match_info["aid"])
+    except ValueError:
+        raise web.HTTPNotFound(text="Файл не найден")
+    async with _maker(request)() as session:
+        att = await session.get(Attachment, aid)
+        req = None
+        if att is not None:
+            req = await session.scalar(
+                select(Request).where(Request.id == att.request_id).options(*REQUEST_LOAD_OPTIONS)
+            )
+        if req is None or not await scope.can_view_request(session, user, req):
+            raise web.HTTPNotFound(text="Файл не найден или недоступен")
+        file_id, media_type = att.file_id, att.media_type
+
+    cached = _media_cache.get(file_id)
+    if cached is not None:
+        _media_cache.move_to_end(file_id)
+        data, content_type = cached
+    else:
+        bot = request.app["bot"]
+        try:
+            info = await bot.get_file(file_id)
+            data = (await bot.download_file(info.file_path)).getvalue()
+        except Exception:
+            raise web.HTTPNotFound(text=MEDIA_TOO_BIG)
+        content_type = (
+            MEDIA_TYPES.get(media_type)
+            or mimetypes.guess_type(info.file_path or "")[0]
+            or "application/octet-stream"
+        )
+        _media_cache_put(file_id, data, content_type)
+    return web.Response(
+        body=data, content_type=content_type,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 RequestAction = Callable[[web.Request, AsyncSession, Request, User, dict], Awaitable[str]]

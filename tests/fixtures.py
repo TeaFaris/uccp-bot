@@ -37,6 +37,24 @@ class FakeBot:
     async def send_media_group(self, chat_id, *args, **kwargs):
         self.sent.append((chat_id, "[media_group]"))
 
+    get_file_calls = 0
+
+    async def get_file(self, file_id):
+        self.get_file_calls += 1
+        if file_id not in self.files:
+            raise RuntimeError("Bad Request: file is too big")
+        data, size = self.files[file_id]
+
+        class _File:
+            file_path = f"photos/{file_id}.jpg"
+            file_size = size
+        return _File()
+
+    async def download_file(self, file_path, destination=None):
+        import io
+        file_id = file_path.split("/")[-1].split(".")[0]
+        return io.BytesIO(self.files[file_id][0])
+
     def to(self, chat_id: int) -> List[str]:
         return [text for cid, text in self.sent if cid == chat_id]
 

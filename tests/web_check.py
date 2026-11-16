@@ -30,7 +30,7 @@ from uccp_bot.utils import utcnow  # noqa: E402
 from uccp_bot.web import auth  # noqa: E402
 from uccp_bot.web.app import build_app  # noqa: E402
 from uccp_bot.utils import utc_from_local  # noqa: E402
-from uccp_bot.db.models import RequestStatusHistory  # noqa: E402
+from uccp_bot.db.models import Attachment, RequestStatusHistory  # noqa: E402
 
 from fixtures import FakeBot  # noqa: E402
 
@@ -104,11 +104,16 @@ async def main() -> None:
         r_moose = await add(opera, staff, 250)
         r_hd = await add(airport, staff, 400)
         r_open = await add(opera, staff, status=Status.NEW)
+        photo = Attachment(request_id=r_moose.id, file_id="PH1", media_type="photo", stage="after")
+        big = Attachment(request_id=r_moose.id, file_id="BIG", media_type="video", stage="after")
+        session.add_all([photo, big])
         await session.commit()
+        media = {"photo": photo.id, "big": big.id}
         moose_no, hd_no = r_moose.number, r_hd.number
         ids = {"moose": r_moose.id, "hd": r_hd.id, "open": r_open.id}
 
     bot = FakeBot()
+    bot.files["PH1"] = (b"\xff\xd8\xff-jpeg-bytes", 18)
     app = build_app(SessionMaker, bot)
     async with TestClient(TestServer(app)) as client:
         print("=== Вход ===")
@@ -157,6 +162,23 @@ async def main() -> None:
         check(resp.status == 403, "Не-админ с верным токеном не может ничего изменить")
         await client.get("/logout")
         await login(client, admin.id)
+
+        print("\n=== Фото и видео ===")
+        card = await (await client.get(f"/requests/{ids['moose']}")).text()
+        check(f'src="/media/{media["photo"]}"' in card, "Фото показано превью в карточке")
+        check(f'href="/media/{media["big"]}"' in card, "Видео открывается по ссылке")
+        resp = await client.get(f"/media/{media['photo']}")
+        body = await resp.read()
+        check(resp.status == 200 and body == b"\xff\xd8\xff-jpeg-bytes", "Фото отдаётся из Telegram")
+        check(resp.headers.get("Content-Type", "").startswith("image/jpeg"), "Тип файла — картинка")
+        check("private" in resp.headers.get("Cache-Control", ""), "Кэш только в браузере")
+        await client.get(f"/media/{media['photo']}")
+        check(bot.get_file_calls == 1, "Повторный просмотр не тянет файл из Telegram заново")
+        resp = await client.get(f"/media/{media['big']}")
+        check(resp.status == 404 and "Telegram" in await resp.text(),
+              "Файл больше 20 МБ — «смотреть в Telegram»")
+        resp = await client.get("/media/999999")
+        check(resp.status == 404, "Несуществующий файл — 404")
 
         print("\n=== Действия с заявкой из панели ===")
         open_url = f"/requests/{ids['open']}"
@@ -240,6 +262,8 @@ async def main() -> None:
               "Операционный директор видит только свой бренд")
         resp = await client.get(f"/requests/{ids['moose']}")
         check(resp.status == 404, "Чужая заявка по прямой ссылке недоступна")
+        resp = await client.get(f"/media/{media['photo']}")
+        check(resp.status == 404, "Фото чужой заявки по прямой ссылке недоступно")
 
         async with SessionMaker() as session:
             session.add(UserScope(user_id=ops_hd.id, outlet_id=opera.id,
