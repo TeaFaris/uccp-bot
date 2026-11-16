@@ -45,11 +45,12 @@ async def main() -> None:
         await asyncio.sleep(0.05)
         check(bot.sent == [], "Обычная сетевая ошибка не вызывает предупреждения")
 
-        logger.error(CONFLICT)
+        for _ in range(3):
+            logger.error(CONFLICT)
         await asyncio.sleep(0.05)
-        check(bot.sent == [], "Одиночный конфликт (перекрытие при деплое) не тревожит владельца")
-        logger.error(CONFLICT)
-        logger.error(CONFLICT)
+        check(bot.sent == [], "Пара-тройка конфликтов (перекрытие при деплое) не тревожит владельца")
+        for _ in range(3):
+            logger.error(CONFLICT)
         await asyncio.sleep(0.05)
         check(sorted(c for c, _ in bot.sent) == [111, 222],
               "Устойчивые конфликты — предупреждение получил каждый владелец")

@@ -32,8 +32,8 @@ class ConflictAlert(logging.Handler):
     COOLDOWN = 6 * 3600     # не чаще раза в 6 часов
     # При деплое старый и новый контейнер пару секунд работают вместе —
     # это один-два конфликта. Вторая копия даёт конфликт каждые ~10 секунд.
-    THRESHOLD = 3
-    WINDOW = 120
+    THRESHOLD = 6
+    WINDOW = 180
 
     def __init__(self, bot, admin_ids: Iterable[int]) -> None:
         super().__init__(level=logging.ERROR)
