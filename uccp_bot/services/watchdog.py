@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -30,18 +30,26 @@ class ConflictAlert(logging.Handler):
     """Ловит TelegramConflictError в журнале aiogram и пишет владельцам."""
 
     COOLDOWN = 6 * 3600     # не чаще раза в 6 часов
+    # При деплое старый и новый контейнер пару секунд работают вместе —
+    # это один-два конфликта. Вторая копия даёт конфликт каждые ~10 секунд.
+    THRESHOLD = 3
+    WINDOW = 120
 
     def __init__(self, bot, admin_ids: Iterable[int]) -> None:
         super().__init__(level=logging.ERROR)
         self.bot = bot
         self.admin_ids = list(admin_ids)
         self._last: Optional[float] = None
+        self._seen: List[float] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             if "TelegramConflictError" not in record.getMessage():
                 return
             now = time.monotonic()
+            self._seen = [t for t in self._seen if now - t < self.WINDOW] + [now]
+            if len(self._seen) < self.THRESHOLD:
+                return
             if self._last is not None and now - self._last < self.COOLDOWN:
                 return
             self._last = now

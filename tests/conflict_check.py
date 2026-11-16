@@ -47,8 +47,12 @@ async def main() -> None:
 
         logger.error(CONFLICT)
         await asyncio.sleep(0.05)
+        check(bot.sent == [], "Одиночный конфликт (перекрытие при деплое) не тревожит владельца")
+        logger.error(CONFLICT)
+        logger.error(CONFLICT)
+        await asyncio.sleep(0.05)
         check(sorted(c for c, _ in bot.sent) == [111, 222],
-              "Конфликт — предупреждение получил каждый владелец")
+              "Устойчивые конфликты — предупреждение получил каждый владелец")
         check("вторая копия" in bot.sent[0][1], "В тексте понятно, что случилось")
 
         logger.error(CONFLICT)
