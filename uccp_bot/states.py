@@ -85,7 +85,8 @@ class AdminFlow(StatesGroup):
     add_executor_phone = State()
     add_executor_username = State()
     search_user = State()
-    assign_pick = State()
+    due_date = State()           # администратор меняет срок: выбор даты
+    due_time = State()           # … и времени
     cancel_reason = State()
     set_phone = State()
     cost_reason = State()

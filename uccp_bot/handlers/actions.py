@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import texts
-from ..callbacks import CalendarCB, ReqCB
+from ..callbacks import CalendarCB, ReqCB, WizardCB
 from ..db.models import (
     Attachment, Category, Comment, Cost, CostStatus, Request, Status, User,
 )
@@ -931,8 +931,8 @@ async def act_change_due(
     if user is None or not user.is_admin:
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
-    await state.set_state(AdminFlow.assign_pick)
-    await state.update_data(request_id=request.id, mode="due_date")
+    await state.set_state(AdminFlow.due_date)
+    await state.update_data(request_id=request.id)
     await call.answer()
     await call.message.answer(
         f"Текущий срок: <b>{fmt_dt(request.due_at)}</b>\nВыберите новую дату:",
@@ -940,7 +940,7 @@ async def act_change_due(
     )
 
 
-@router.callback_query(AdminFlow.assign_pick, CalendarCB.filter(F.act == "nav"))
+@router.callback_query(AdminFlow.due_date, CalendarCB.filter(F.act == "nav"))
 async def admin_due_nav(call: types.CallbackQuery, callback_data: CalendarCB) -> None:
     await call.answer()
     await call.message.edit_reply_markup(
@@ -948,18 +948,19 @@ async def admin_due_nav(call: types.CallbackQuery, callback_data: CalendarCB) ->
     )
 
 
-@router.callback_query(AdminFlow.assign_pick, CalendarCB.filter(F.act == "day"))
+@router.callback_query(AdminFlow.due_date, CalendarCB.filter(F.act == "day"))
 async def admin_due_day(
     call: types.CallbackQuery, callback_data: CalendarCB, state: FSMContext
 ) -> None:
     await state.update_data(
         year=callback_data.year, month=callback_data.month, day=callback_data.day
     )
+    await state.set_state(AdminFlow.due_time)
     await call.answer()
     await call.message.edit_text("Выберите время:", reply_markup=time_kb())
 
 
-@router.callback_query(AdminFlow.assign_pick, CalendarCB.filter(F.act == "time"))
+@router.callback_query(AdminFlow.due_time, CalendarCB.filter(F.act == "time"))
 async def admin_due_time(
     call: types.CallbackQuery,
     callback_data: CalendarCB,
@@ -994,6 +995,44 @@ async def admin_due_time(
     await notify.notify_request_watchers(
         session, bot, request, note, to_author=True, to_executor=True, exclude_user_id=user.id
     )
+
+
+# «Назад» и «Отменить» в календаре срока: и у исполнителя (предложение),
+# и у администратора (изменение). Раньше их нажатие уходило в «сообщение устарело».
+DUE_DATE_STEPS = (ExecutorFlow.propose_date, AdminFlow.due_date)
+DUE_TIME_STEPS = {
+    ExecutorFlow.propose_time.state: ExecutorFlow.propose_date,
+    AdminFlow.due_time.state: AdminFlow.due_date,
+}
+
+
+@router.callback_query(
+    StateFilter(*DUE_DATE_STEPS, ExecutorFlow.propose_time, AdminFlow.due_time),
+    WizardCB.filter(F.step.in_({"back", "cancel"})),
+)
+async def due_back_or_cancel(
+    call: types.CallbackQuery,
+    callback_data: WizardCB,
+    state: FSMContext,
+    session: AsyncSession,
+) -> None:
+    current = await state.get_state()
+    previous = DUE_TIME_STEPS.get(current)
+    if callback_data.step == "back" and previous is not None:
+        # с выбора времени — обратно к календарю
+        await state.set_state(previous)
+        data = await state.get_data()
+        request = await load_request(session, data["request_id"])
+        await call.answer()
+        await call.message.edit_text(
+            f"Текущий срок: <b>{fmt_dt(request.due_at)}</b>\nВыберите новую дату:",
+            reply_markup=calendar_kb(data.get("year"), data.get("month")),
+        )
+        return
+    # «Отменить» или «Назад» с первого шага — выходим без изменений
+    await state.clear()
+    await call.answer("Изменение срока отменено")
+    await call.message.edit_text("Изменение срока отменено, срок остался прежним.")
 
 
 @router.callback_query(ReqCB.filter(F.act == "cancel"))
@@ -1043,7 +1082,7 @@ async def cancel_reason(
 # Только состояния этого роутера — состояния админ-панели обрабатывает handlers/admin.py
 @router.message(
     StateFilter(
-        ExecutorFlow, ManagerFlow, AdminFlow.cancel_reason, AdminFlow.assign_pick,
+        ExecutorFlow, ManagerFlow, AdminFlow.cancel_reason, AdminFlow.due_date, AdminFlow.due_time,
         AdminFlow.cost_reason, AdminFlow.edit_cost_work, AdminFlow.edit_cost_material,
         AdminFlow.edit_reason,
     )

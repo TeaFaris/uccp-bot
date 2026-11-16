@@ -28,6 +28,8 @@ def _int_list(raw: str) -> List[int]:
 class Config:
     bot_token: str = os.getenv("BOT_TOKEN", "")
     db_url: str = os.getenv("DB_URL", "sqlite+aiosqlite:///uccp.db")
+    # шаги диалогов (FSM); по умолчанию — fsm.db рядом с основной базой
+    fsm_db_path: str = os.getenv("FSM_DB_PATH", "")
     timezone: str = os.getenv("TIMEZONE", "Asia/Dushanbe")
     currency: str = os.getenv("CURRENCY", "сомони")
     overdue_check_minutes: int = int(os.getenv("OVERDUE_CHECK_MINUTES", "15"))
@@ -69,6 +71,15 @@ class Config:
     backup_to_telegram: bool = os.getenv("BACKUP_TO_TELEGRAM", "1") not in ("0", "false", "")
     monthly_report_day: int = int(os.getenv("MONTHLY_REPORT_DAY", "1"))
     monthly_report_hour: int = int(os.getenv("MONTHLY_REPORT_HOUR", "1"))
+
+    @property
+    def fsm_path(self) -> str:
+        if self.fsm_db_path:
+            return self.fsm_db_path
+        if self.db_url.startswith("sqlite") and ":///" in self.db_url:
+            db_file = self.db_url.split(":///", 1)[1]
+            return os.path.join(os.path.dirname(db_file), "fsm.db")
+        return os.path.join(BASE_DIR, "fsm.db")
 
     @property
     def google_enabled(self) -> bool:

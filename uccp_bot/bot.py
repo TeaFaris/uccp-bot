@@ -8,7 +8,6 @@ import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 import time
@@ -18,6 +17,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from .config import config
 from .db.base import SessionMaker, init_db
 from .db.seed import ensure_bootstrap_admins, seed
+from .fsm_storage import SQLiteStorage
 from .handlers import (
     actions, admin, approval, create, diag, fallback, groups,
     help as help_handlers, lists, org, panel, reports, start,
@@ -107,8 +107,13 @@ def build_session() -> TimedSession:
     return session
 
 
+def build_storage() -> SQLiteStorage:
+    """Шаги диалогов хранятся на диске и переживают перезапуск бота."""
+    return SQLiteStorage(config.fsm_path)
+
+
 def build_dispatcher() -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=build_storage())
 
     dp.update.middleware(PerfMiddleware())
     dp.update.middleware(DbSessionMiddleware(SessionMaker))
@@ -156,6 +161,12 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = build_dispatcher()
+    if config.bootstrap_admin_ids:
+        from .services.watchdog import ConflictAlert
+
+        logging.getLogger("aiogram.dispatcher").addHandler(
+            ConflictAlert(bot, config.bootstrap_admin_ids)
+        )
 
     await on_startup(bot)
     scheduler = setup_scheduler(SessionMaker, bot)

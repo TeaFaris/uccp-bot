@@ -44,6 +44,7 @@ BOT_ID = 123456789
 class Outbox:
     def __init__(self) -> None:
         self.messages: List[dict] = []
+        self.alerts: List[str] = []     # тексты всплывающих ответов на нажатия
 
     def add(self, chat_id: int, text: str, markup: Any, message_id: int) -> None:
         self.messages.append(
@@ -61,6 +62,7 @@ class Outbox:
 
     def clear(self) -> None:
         self.messages.clear()
+        self.alerts.clear()
 
 
 OUT = Outbox()
@@ -84,7 +86,11 @@ class MockSession(BaseSession):
 
         if name == "GetMe":
             return TgUser(id=BOT_ID, is_bot=True, first_name="UCCP", username="uccp_test_bot")
-        if name in ("SetMyCommands", "AnswerCallbackQuery", "DeleteMessage"):
+        if name == "AnswerCallbackQuery":
+            if getattr(method, "text", None):
+                OUT.alerts.append(method.text)
+            return True
+        if name in ("SetMyCommands", "DeleteMessage"):
             return True
 
         chat_id = getattr(method, "chat_id", None)
@@ -420,6 +426,63 @@ async def main() -> None:
         check(req is not None and req.status == Status.NEW, f"Статус: {req.status}")
         number = req.number
     print(f"   номер заявки: {number}")
+
+    # ---------------- смена срока: календарь без тупиков ----------------
+    print("\n=== Смена срока: «Назад», «Отменить» и перезапуск бота ===")
+    from uccp_bot.callbacks import ReqCB
+
+    async with SessionMaker() as session:
+        req = await session.scalar(select(Request))
+        rid, due_before = req.id, req.due_at
+    saved_messages = list(OUT.messages)     # карточки в личках нужны сценарию дальше
+
+    def stale_seen(uid: int = 5001) -> bool:
+        said = " ".join(OUT.alerts) + OUT.texts_for(uid)
+        return "устарел" in said or "прервано" in said or "не заполняется" in said
+
+    # «Отменить» прямо в календаре
+    OUT.clear()
+    await admin.raw_callback(1, ReqCB(act="change_due", request_id=rid).pack())
+    check("Выберите новую дату" in OUT.texts_for(5001), "Администратор открыл календарь срока")
+    await admin.click("Отменить")
+    check(not stale_seen(), "«Отменить» в календаре срока не ведёт в «устарело»")
+    check("отменено" in OUT.texts_for(5001).lower(), "Бот подтверждает отмену изменения срока")
+    check(not admin.has_button("Завтра"), "Кнопки календаря после отмены сняты")
+
+    # «Назад» с выбора времени возвращает к календарю
+    OUT.clear()
+    await admin.raw_callback(1, ReqCB(act="change_due", request_id=rid).pack())
+    await admin.click("Завтра")
+    check("Выберите время" in OUT.texts_for(5001), "После даты предложено время")
+    await admin.click("Назад")
+    check(not stale_seen(), "«Назад» с выбора времени не ведёт в «устарело»")
+    check(admin.has_button("Завтра"), "«Назад» вернул к календарю")
+
+    # бот перезапустился (деплой), пока календарь открыт — шаг не теряется
+    # перезапуск = новое хранилище состояний в новом процессе
+    from uccp_bot.bot import build_storage
+    await dp.fsm.storage.close()
+    dp.fsm.storage = build_storage()
+    restarted = admin
+    await restarted.click("Завтра")
+    check(not stale_seen(), "После перезапуска бота кнопки календаря работают")
+    await restarted.click("15:00")
+    async with SessionMaker() as session:
+        req = await session.scalar(select(Request))
+        check(req.due_at != due_before, "Срок изменён после перезапуска")
+        check(req.due_at.hour != due_before.hour or req.due_at.day != due_before.day,
+              "Новый срок сохранён в базе")
+
+    # исполнитель: «Отменить» в календаре предложения срока
+    OUT.clear()
+    await electrician.raw_callback(1, ReqCB(act="propose", request_id=rid).pack())
+    check("Выберите новую дату" in OUT.texts_for(5003), "Исполнитель открыл календарь")
+    await electrician.click("Отменить")
+    check(not stale_seen(5003), "«Отменить» у исполнителя не ведёт в «устарело»")
+    async with SessionMaker() as session:
+        req = await session.scalar(select(Request))
+        check(req.status == Status.NEW, "Статус заявки не изменился после отмены")
+    OUT.messages[:0] = saved_messages
 
     # ---------------- исполнитель ----------------
     print("\n=== Исполнитель: принять → начать → выполнить ===")
