@@ -16,6 +16,7 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Optional, Tuple
 
 from aiohttp import web
+from multidict import MultiDictProxy
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -33,7 +34,6 @@ from ..db.models import (
     RequestStatusHistory,
     Status,
     User,
-    UserStatus,
 )
 from ..services import history, request_ops, routing
 from ..services import org as org_service
@@ -68,10 +68,10 @@ async def _guard(request: web.Request) -> Optional[User]:
 FLASH_COOKIE = "uccp_flash"
 
 
-async def _admin_post(request: web.Request) -> Tuple[User, dict]:
+async def _admin_post(request: web.Request) -> Tuple[User, "MultiDictProxy"]:
     """Вход + верный токен формы + право администратора — иначе 403."""
     user = await _guard(request)
-    form = dict(await request.post())
+    form = await request.post()
     if not auth.check_csrf(request, form.get("csrf", "")):
         raise web.HTTPForbidden(text="Форма устарела — обновите страницу и повторите.")
     if not user.can_manage_users:
@@ -420,12 +420,7 @@ def _request_actions_html(req, acts, executors, categories, csrf: str) -> str:
     url = f"/requests/{req.id}/do"
 
     def form(action: str, title: str, fields: str, button: str, danger: bool = False) -> str:
-        cls = ' class="danger"' if danger else ""
-        return (
-            f'<div class="act"><h3>{esc(title)}</h3>'
-            f'<form method="post" action="{url}/{action}">{views.csrf_input(csrf)}'
-            f'{fields}<button type="submit"{cls}>{esc(button)}</button></form></div>'
-        )
+        return views.action_box(f"{url}/{action}", title, fields, button, csrf, danger)
 
     def textarea(name: str, placeholder: str) -> str:
         return f'<textarea name="{name}" required placeholder="{esc(placeholder)}"></textarea>'
@@ -919,47 +914,6 @@ async def reports_page(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------- #
 # Пользователи (только главный администратор)
 # --------------------------------------------------------------------------- #
-@routes.get("/users")
-async def users_page(request: web.Request) -> web.Response:
-    user = await _guard(request)
-    if not user.can_manage_users:
-        raise web.HTTPForbidden(text="Раздел доступен только главному администратору")
-    async with _maker(request)() as session:
-        rows = list((await session.scalars(select(User).order_by(User.full_name))).all())
-        brands = {b.id: b.name for b in (await session.scalars(select(Brand))).all()}
-        outlets = {o.id: o.name for o in (await session.scalars(select(Outlet))).all()}
-
-    status_kind = {UserStatus.ACTIVE: "green", UserStatus.PENDING: "amber",
-                   UserStatus.BLOCKED: "red", UserStatus.DISABLED: "red",
-                   UserStatus.REJECTED: "red"}
-    table_rows = [
-        [
-            esc(u.full_name),
-            esc(u.role_title),
-            views.tag(UserStatus.TITLES.get(u.status, u.status),
-                      status_kind.get(u.status, "")),
-            esc(u.position_text or "—"),
-            esc(brands.get(u.brand_id, "—")),
-            esc(outlets.get(u.outlet_id, "—")),
-            esc(u.phone or "—"),
-            "да" if u.tg_id else "нет",
-        ]
-        for u in rows
-    ]
-    body = (
-        "<h1>Пользователи</h1>"
-        '<p class="muted">Изменение ролей и прав — в боте: '
-        "⚙️ Администрирование → 👥 Пользователи.</p>"
-        + views.table(
-            ["Ф.И.О.", "Роль", "Статус", "Должность", "Бренд", "Точка",
-             "Телефон", "Бот активирован"],
-            table_rows,
-        )
-    )
-    return web.Response(text=views.page("Пользователи", body, user, "users"),
-                        content_type="text/html")
-
-
 @routes.get("/healthz")
 async def healthz(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
@@ -970,6 +924,9 @@ def build_app(session_maker: async_sessionmaker, bot=None) -> web.Application:
     app["session_maker"] = session_maker
     app["bot"] = bot            # для уведомлений в Telegram из действий панели
     app.add_routes(routes)
+    from . import manage        # пользователи и справочники — отдельным модулем
+
+    app.add_routes(manage.routes)
     return app
 
 

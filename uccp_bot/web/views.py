@@ -81,6 +81,8 @@ button:hover{background:#1d4ed8}
 .act button.danger{background:#b91c1c;color:#fff;border-color:#b91c1c}
 .media{display:flex;flex-wrap:wrap;gap:8px}.media img{height:120px;border-radius:8px;
   border:1px solid #e2e8f0;object-fit:cover}
+.tabs{margin:0 0 14px;font-size:14px}.tabs a{margin-right:14px}.tabs a.on{font-weight:700}
+.checks{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:13px}
 .inline{display:inline;margin:0}.inline button{padding:2px 8px;font-size:12px}
 @media(max-width:700px){.row{grid-template-columns:1fr}
   table{display:block;overflow-x:auto}main{padding:12px}}
@@ -105,6 +107,7 @@ def page(title: str, body: str, user: Optional[User] = None, active: str = "") -
                  ("/org", "Заявки в УЦЦП", "org"), ("/reports", "Отчёты", "reports")]
         if user.can_manage_users:
             items.append(("/users", "Пользователи", "users"))
+            items.append(("/catalog", "Справочники", "catalog"))
         nav = "".join(
             f'<a href="{href}" class="{"active" if key == active else ""}">{esc(label)}</a>'
             for href, label, key in items
@@ -167,6 +170,36 @@ def table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
     if not body:
         body = f'<tr><td colspan="{len(headers)}" class="muted">Ничего не найдено</td></tr>'
     return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def options_html(options: Sequence[Tuple[object, str]], current: object = None) -> str:
+    return "".join(
+        f'<option value="{esc(str(value))}"{" selected" if str(value) == str(current) else ""}>'
+        f"{esc(text)}</option>"
+        for value, text in options
+    )
+
+
+def action_box(url: str, title: str, fields: str, button: str, csrf: str,
+               danger: bool = False) -> str:
+    """Карточка-форма одного действия администратора."""
+    cls = ' class="danger"' if danger else ""
+    return (
+        f'<div class="act"><h3>{esc(title)}</h3>'
+        f'<form method="post" action="{url}">{csrf_input(csrf)}'
+        f'{fields}<button type="submit"{cls}>{esc(button)}</button></form></div>'
+    )
+
+
+def inline_button(url: str, button: str, csrf: str, hidden: Sequence[Tuple[str, object]] = ()) -> str:
+    """Маленькая кнопка-форма в строке таблицы (например, «снять»)."""
+    fields = "".join(
+        f'<input type="hidden" name="{esc(k)}" value="{esc(str(v))}">' for k, v in hidden
+    )
+    return (
+        f'<form class="inline" method="post" action="{url}">{csrf_input(csrf)}{fields}'
+        f'<button type="submit">{esc(button)}</button></form>'
+    )
 
 
 def select_field(name: str, label: str, options: List[Tuple[str, str]], current: str) -> str:

@@ -30,7 +30,7 @@ from uccp_bot.utils import utcnow  # noqa: E402
 from uccp_bot.web import auth  # noqa: E402
 from uccp_bot.web.app import build_app  # noqa: E402
 from uccp_bot.utils import utc_from_local  # noqa: E402
-from uccp_bot.db.models import Attachment, RequestStatusHistory  # noqa: E402
+from uccp_bot.db.models import Attachment, ExecutorAssignment, RequestStatusHistory  # noqa: E402
 
 from fixtures import FakeBot  # noqa: E402
 
@@ -81,6 +81,7 @@ async def main() -> None:
         staff = make(4, "Сотрудник точки", RoleCode.STAFF, moose, opera)
         blocked = make(5, "Отключённый", RoleCode.ADMIN, status=UserStatus.BLOCKED)
         master2 = make(901, "Второй мастер", RoleCode.EXECUTOR)
+        newbie = make(6, "Новичок Регистрация", RoleCode.STAFF, status=UserStatus.PENDING)
         await session.flush()
 
         async def add(outlet, author, cost=None, status=Status.CLOSED):
@@ -229,6 +230,77 @@ async def main() -> None:
         await login(client, chief.id)
         card = await (await client.get(f"/requests/{ids['moose']}")).text()
         check("/do/" not in card, "Руководителю формы действий не показываются")
+        await client.get("/logout")
+        await login(client, admin.id)
+
+        print("\n=== Регистрации и пользователи ===")
+        text = await (await client.get("/users?status=pending")).text()
+        check("Новичок Регистрация" in text and f'href="/users/{newbie.id}"' in text,
+              "Заявки на регистрацию видны списком со ссылками")
+        check("Сотрудник точки" not in text, "Фильтр по статусу работает")
+        card = await (await client.get(f"/users/{newbie.id}")).text()
+        check("Одобрить регистрацию" in card and "Отклонить" in card, "Карточка заявки на регистрацию")
+
+        async def user_act(uid, name, **fields):
+            data = [("csrf", csrf(client))]
+            for key, value in fields.items():
+                for item in (value if isinstance(value, list) else [value]):
+                    data.append((key, str(item)))
+            resp = await client.post(f"/users/{uid}/do/{name}", data=data)
+            return await resp.text()
+
+        bot.clear()
+        page = await user_act(newbie.id, "approve", role=RoleCode.EXECUTOR, brand_id=moose.id,
+                              outlet_id="", category_ids=[electric.id])
+        async with SessionMaker() as session:
+            u = await session.get(User, newbie.id)
+            dirs = (await session.scalars(select(ExecutorAssignment).where(
+                ExecutorAssignment.user_id == newbie.id))).all()
+        check(u.status == UserStatus.ACTIVE and u.role_code == RoleCode.EXECUTOR,
+              "Регистрация одобрена из панели")
+        check([d.category_id for d in dirs] == [electric.id], "Направления мастера сохранены")
+        check(bot.to(6) and "подтверждена" in page, "Человек уведомлён, итог показан")
+
+        await user_act(newbie.id, "role", role=RoleCode.STAFF)
+        page = await user_act(newbie.id, "outlet", outlet_id=opera.id)
+        await user_act(newbie.id, "phone", phone="+992 900 00 00 01")
+        async with SessionMaker() as session:
+            u = await session.get(User, newbie.id)
+        check(u.role_code == RoleCode.STAFF and u.outlet_id == opera.id and "900" in (u.phone or ""),
+              "Роль, точка и телефон меняются из панели")
+        page = await user_act(admin.id, "status", status=UserStatus.BLOCKED)
+        check("самого себя" in page, "Себя заблокировать нельзя — понятная ошибка")
+        await user_act(newbie.id, "status", status=UserStatus.BLOCKED)
+        async with SessionMaker() as session:
+            check((await session.get(User, newbie.id)).status == UserStatus.BLOCKED,
+                  "Пользователь заблокирован из панели")
+
+        card = await (await client.get(f"/users/{ops_hd.id}")).text()
+        check("Закреплённые объекты" in card, "Опердиректору можно закрепить объекты")
+        await user_act(ops_hd.id, "scope_add", target=f"o{opera.id}")
+        async with SessionMaker() as session:
+            row = await session.scalar(select(UserScope).where(UserScope.user_id == ops_hd.id))
+        check(row is not None and row.outlet_id == opera.id, "Объект закреплён из панели")
+        await user_act(ops_hd.id, "scope_del", scope_id=row.id)
+        async with SessionMaker() as session:
+            check(await session.get(UserScope, row.id) is None, "Объект откреплён из панели")
+
+        card = await (await client.get(f"/users/{master2.id}")).text()
+        check("Направления мастера" in card and "Оплата" in card, "У мастера — направления и оплата")
+        await user_act(master2.id, "dir_add", category_id=electric.id, target=f"b{moose.id}")
+        await user_act(master2.id, "payment", fixed="1")
+        async with SessionMaker() as session:
+            d = await session.scalar(select(ExecutorAssignment).where(
+                ExecutorAssignment.user_id == master2.id))
+            m2 = await session.get(User, master2.id)
+        check(d is not None and d.brand_id == moose.id and m2.fixed_payment,
+              "Направление и оплата мастера меняются из панели")
+        await user_act(master2.id, "dir_del", assignment_id=d.id)
+
+        await client.get("/logout")
+        await login(client, chief.id)
+        resp = await client.get(f"/users/{newbie.id}")
+        check(resp.status == 403, "Карточка пользователя — только главному администратору")
         await client.get("/logout")
         await login(client, admin.id)
 
