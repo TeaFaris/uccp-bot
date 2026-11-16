@@ -174,7 +174,7 @@ async def main() -> None:
 
     from .web.app import start_panel
 
-    panel_runner = await start_panel(SessionMaker)
+    panel_runner = await start_panel(SessionMaker, bot)
     if panel_runner is not None:
         log.info(
             "Панель просмотра: http://%s:%s", config.web_host, config.web_port

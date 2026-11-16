@@ -13,7 +13,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from aiohttp import web
 from sqlalchemy import select
@@ -41,6 +41,11 @@ _codes: Dict[str, LoginCode] = {}
 _failures: Dict[str, Tuple[int, float]] = {}
 FAIL_LIMIT = 10         # попыток
 FAIL_WINDOW = 300       # за 5 минут
+# Общий лимит ошибок со всех адресов: адрес клиента можно подменить,
+# а этот счётчик — нет. При превышении вход закрыт до конца окна
+# (уже вошедших это не касается).
+GLOBAL_FAIL_LIMIT = 30
+_global_failures: List[float] = []
 
 
 def _secret() -> bytes:
@@ -71,6 +76,9 @@ def check_code(code: str, client_ip: str) -> Optional[int]:
     """
     _cleanup()
     now = time.time()
+    _global_failures[:] = [t for t in _global_failures if now - t < FAIL_WINDOW]
+    if len(_global_failures) >= GLOBAL_FAIL_LIMIT:
+        return None
     fails, since = _failures.get(client_ip, (0, now))
     if now - since > FAIL_WINDOW:         # окно истекло — счётчик сбрасывается
         fails, since = 0, now
@@ -80,9 +88,37 @@ def check_code(code: str, client_ip: str) -> Optional[int]:
     entry = _codes.pop(code.strip(), None)   # код одноразовый
     if entry is None:
         _failures[client_ip] = (fails + 1, since)
+        _global_failures.append(now)
         return None
     _failures.pop(client_ip, None)
     return entry.user_id
+
+
+def client_ip(request: web.Request) -> str:
+    """Адрес клиента: последний элемент X-Forwarded-For — его дописывает Traefik.
+
+    Первые элементы присылает сам клиент, верить им нельзя.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded.strip():
+        return forwarded.split(",")[-1].strip()
+    return request.remote or "?"
+
+
+def csrf_for(raw_cookie: str) -> str:
+    """Токен форм привязан к сессии: без куки сессии подделать его нельзя."""
+    if not raw_cookie:
+        return ""
+    return hmac.new(_secret(), b"csrf:" + raw_cookie.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def csrf_token(request: web.Request) -> str:
+    return csrf_for(request.cookies.get(COOKIE_NAME, ""))
+
+
+def check_csrf(request: web.Request, sent: str) -> bool:
+    expected = csrf_token(request)
+    return bool(expected) and hmac.compare_digest(str(sent or "").encode(), expected.encode())
 
 
 def sign_session(user_id: int) -> str:

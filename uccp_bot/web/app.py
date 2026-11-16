@@ -1,16 +1,17 @@
-"""Панель просмотра в браузере.
+"""Панель в браузере: просмотр для всех ролей, правка — для администратора.
 
-Только чтение: никаких действий с заявками здесь нет — назначение,
-статусы, согласование и подтверждение выполняются в Telegram, где
-работают уведомления и журнал действий.
+Правка идёт только через общий слой действий (`services/*_ops.py`) — тот же,
+что вызывает бот, поэтому уведомления в Telegram и журнал работают так же.
 
 Область видимости берётся из тех же правил, что и в боте
 (`services/scope.py`), поэтому руководитель видит ровно свои объекты.
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
-from typing import List, Optional
+import json
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from aiohttp import web
 from sqlalchemy import func, select
@@ -31,10 +32,12 @@ from ..db.models import (
     User,
     UserStatus,
 )
+from ..services import history
 from ..services import org as org_service
 from ..services import reports as reports_service
 from ..services import scope
-from ..services.cards import REQUEST_LOAD_OPTIONS
+from ..services.cards import REQUEST_LOAD_OPTIONS, load_request
+from ..services.ops import ActionError
 from ..services.history import ACTION_TITLES
 from ..utils import esc, fmt_dt, fmt_money, parse_date
 from . import auth, views
@@ -55,6 +58,59 @@ async def _guard(request: web.Request) -> Optional[User]:
 
 
 # --------------------------------------------------------------------------- #
+# Правка: формы, сообщения после действия
+# --------------------------------------------------------------------------- #
+FLASH_COOKIE = "uccp_flash"
+
+
+async def _admin_post(request: web.Request) -> Tuple[User, dict]:
+    """Вход + верный токен формы + право администратора — иначе 403."""
+    user = await _guard(request)
+    form = dict(await request.post())
+    if not auth.check_csrf(request, form.get("csrf", "")):
+        raise web.HTTPForbidden(text="Форма устарела — обновите страницу и повторите.")
+    if not user.can_manage_users:
+        raise web.HTTPForbidden(text="Изменения доступны только главному администратору")
+    return user, form
+
+
+def _back(location: str, message: str, ok: bool = True) -> web.HTTPSeeOther:
+    """Редирект обратно с одноразовым сообщением об итоге действия."""
+    response = web.HTTPSeeOther(location)
+    payload = json.dumps({"ok": ok, "text": message}, ensure_ascii=False).encode()
+    response.set_cookie(
+        FLASH_COOKIE, base64.urlsafe_b64encode(payload).decode(),
+        max_age=60, httponly=True, samesite="Lax", secure=config.web_https,
+    )
+    return response
+
+
+def _read_flash(raw: Optional[str]) -> Optional[dict]:
+    try:
+        return json.loads(base64.urlsafe_b64decode(raw.encode())) if raw else None
+    except Exception:
+        return None
+
+
+@web.middleware
+async def panel_middleware(request: web.Request, handler):
+    """Действия из панели помечаются в журнале; сообщение об итоге показывается один раз."""
+    token = history.SOURCE.set("панель")
+    try:
+        response = await handler(request)
+    finally:
+        history.SOURCE.reset(token)
+    flash = _read_flash(request.cookies.get(FLASH_COOKIE))
+    if (flash and isinstance(response, web.Response) and response.text
+            and response.content_type == "text/html"):
+        response.text = response.text.replace(
+            "<main>", "<main>" + views.flash(flash.get("text", ""), flash.get("ok", True)), 1
+        )
+        response.del_cookie(FLASH_COOKIE)
+    return response
+
+
+# --------------------------------------------------------------------------- #
 # Вход
 # --------------------------------------------------------------------------- #
 @routes.get("/login")
@@ -68,8 +124,7 @@ async def login_form(request: web.Request) -> web.Response:
 async def login_submit(request: web.Request) -> web.Response:
     data = await request.post()
     code = str(data.get("code", ""))
-    ip = request.headers.get("X-Forwarded-For", request.remote or "?").split(",")[0]
-    user_id = auth.check_code(code, ip)
+    user_id = auth.check_code(code, auth.client_ip(request))
     if user_id is None:
         return web.Response(
             text=views.login_page("Код неверный или истёк. Запросите новый: /panel"),
@@ -341,6 +396,33 @@ async def request_card(request: web.Request) -> web.Response:
     )
 
 
+RequestAction = Callable[[web.Request, AsyncSession, Request, User, dict], Awaitable[str]]
+# действие -> обработчик, возвращающий текст об успехе; заполняется ниже
+REQUEST_ACTIONS: Dict[str, RequestAction] = {}
+
+
+@routes.post("/requests/{rid}/do/{action}")
+async def request_action(request: web.Request) -> web.Response:
+    user, form = await _admin_post(request)
+    action = REQUEST_ACTIONS.get(request.match_info["action"])
+    if action is None:
+        raise web.HTTPNotFound(text="Неизвестное действие")
+    rid = int(request.match_info["rid"])
+    back = f"/requests/{rid}"
+    async with _maker(request)() as session:
+        req = await load_request(session, rid)
+        if req is None:
+            raise web.HTTPNotFound(text="Заявка не найдена")
+        actor = await session.get(User, user.id)
+        try:
+            message = await action(request, session, req, actor, form)
+        except ActionError as exc:
+            await session.rollback()
+            return _back(back, str(exc), ok=False)
+        await session.commit()
+    return _back(back, message)
+
+
 # --------------------------------------------------------------------------- #
 # Заявки в УЦЦП
 # --------------------------------------------------------------------------- #
@@ -596,18 +678,19 @@ async def healthz(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
-def build_app(session_maker: async_sessionmaker) -> web.Application:
-    app = web.Application()
+def build_app(session_maker: async_sessionmaker, bot=None) -> web.Application:
+    app = web.Application(middlewares=[panel_middleware])
     app["session_maker"] = session_maker
+    app["bot"] = bot            # для уведомлений в Telegram из действий панели
     app.add_routes(routes)
     return app
 
 
-async def start_panel(session_maker: async_sessionmaker) -> Optional[web.AppRunner]:
+async def start_panel(session_maker: async_sessionmaker, bot=None) -> Optional[web.AppRunner]:
     """Поднимает панель рядом с ботом в том же процессе."""
     if not config.web_enabled:
         return None
-    app = build_app(session_maker)
+    app = build_app(session_maker, bot)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, config.web_host, config.web_port)

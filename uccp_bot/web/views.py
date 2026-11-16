@@ -68,6 +68,20 @@ button:hover{background:#1d4ed8}
 .err{background:#fee2e2;color:#b91c1c;padding:9px 12px;border-radius:8px;margin-bottom:12px;
      font-size:14px}
 .note{background:#eff6ff;color:#1e40af;padding:10px 12px;border-radius:8px;font-size:13px}
+.flash{padding:10px 14px;border-radius:8px;margin-bottom:14px;font-size:14px}
+.flash.ok{background:#dcfce7;color:#166534}.flash.err{background:#fee2e2;color:#b91c1c}
+.actions{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin:14px 0}
+.act{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px}
+.act h3{margin:0 0 8px;font-size:14px}
+.act form{display:flex;flex-direction:column;gap:6px;margin:0}
+.act input,.act select,.act textarea{width:100%;box-sizing:border-box;font:inherit;padding:6px 8px;
+  border:1px solid #cbd5e1;border-radius:6px}
+.act textarea{min-height:56px}
+.act button{align-self:flex-start;padding:6px 14px}
+.act button.danger{background:#b91c1c;color:#fff;border-color:#b91c1c}
+.media{display:flex;flex-wrap:wrap;gap:8px}.media img{height:120px;border-radius:8px;
+  border:1px solid #e2e8f0;object-fit:cover}
+.inline{display:inline;margin:0}.inline button{padding:2px 8px;font-size:12px}
 @media(max-width:700px){.row{grid-template-columns:1fr}
   table{display:block;overflow-x:auto}main{padding:12px}}
 """
@@ -110,6 +124,15 @@ def page(title: str, body: str, user: Optional[User] = None, active: str = "") -
         f"<title>{esc(title)} · УЦЦП</title><style>{CSS}</style></head><body>"
         f"{header}<main>{body}</main></body></html>"
     )
+
+
+def flash(text: str, ok: bool = True) -> str:
+    kind = "flash ok" if ok else "flash err"
+    return f'<div class="{kind}">{esc(text)}</div>'
+
+
+def csrf_input(token: str) -> str:
+    return f'<input type="hidden" name="csrf" value="{esc(token)}">'
 
 
 def login_page(error: str = "") -> str:

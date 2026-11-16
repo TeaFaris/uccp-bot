@@ -1,4 +1,4 @@
-"""Панель просмотра: вход по коду, области видимости, режим только чтения.
+"""Панель: вход по коду, области видимости, защита форм правки.
 
 Запуск: .venv/bin/python tests/web_check.py
 """
@@ -35,6 +35,12 @@ def check(condition: bool, label: str) -> None:
     print(("✅ " if condition else "❌ ") + label)
     if not condition:
         raise AssertionError(label)
+
+
+def csrf(client: TestClient) -> str:
+    """Токен формы для текущей сессии — тот же, что панель кладёт в формы."""
+    cookie = client.session.cookie_jar.filter_cookies(client.make_url("/")).get(auth.COOKIE_NAME)
+    return auth.csrf_for(cookie.value if cookie else "")
 
 
 async def login(client: TestClient, user_id: int) -> None:
@@ -123,13 +129,41 @@ async def main() -> None:
         check("250" in card and "согласована" in card,
               "Видны стоимость и статус согласования")
 
-        print("\n=== Только чтение ===")
-        for method, path in (("post", "/requests"), ("post", f"/requests/{ids['moose']}"),
-                             ("delete", f"/requests/{ids['moose']}"),
-                             ("post", "/users")):
+        print("\n=== Правка: защита форм ===")
+        action_url = f"/requests/{ids['moose']}/do/comment"
+        resp = await client.post(action_url, data={"text": "без токена"}, allow_redirects=False)
+        check(resp.status == 403, "POST без CSRF-токена отклоняется")
+        resp = await client.post(action_url, data={"text": "x", "csrf": "чужой"},
+                                 allow_redirects=False)
+        check(resp.status == 403, "POST с чужим CSRF-токеном отклоняется")
+        resp = await client.post(f"/requests/{ids['moose']}/do/nonexistent",
+                                 data={"csrf": csrf(client)}, allow_redirects=False)
+        check(resp.status == 404, "Неизвестное действие — 404")
+        for method, path in (("post", "/requests"), ("delete", f"/requests/{ids['moose']}")):
             resp = await getattr(client, method)(path)
-            check(resp.status in (404, 405),
-                  f"{method.upper()} {path} — изменений через панель нет ({resp.status})")
+            check(resp.status in (404, 405), f"{method.upper()} {path} — такого маршрута нет")
+
+        await client.get("/logout")
+        await login(client, chief.id)
+        resp = await client.post(action_url, data={"text": "руководитель", "csrf": csrf(client)},
+                                 allow_redirects=False)
+        check(resp.status == 403, "Не-админ с верным токеном не может ничего изменить")
+        await client.get("/logout")
+        await login(client, admin.id)
+
+        print("\n=== Перебор кода входа ===")
+        await client.get("/logout")
+        auth.GLOBAL_FAIL_LIMIT = 5
+        for i in range(5):
+            await client.post("/login", data={"code": "000000"},
+                              headers={"X-Forwarded-For": f"10.0.0.{i}"})
+        good = auth.issue_code(admin.id)
+        resp = await client.post("/login", data={"code": good},
+                                 headers={"X-Forwarded-For": "10.9.9.9"}, allow_redirects=False)
+        check(resp.status == 401, "Смена X-Forwarded-For не обходит общий лимит ошибок")
+        auth.GLOBAL_FAIL_LIMIT = 30
+        auth._global_failures.clear()
+        await login(client, admin.id)
 
         print("\n=== Область видимости ===")
         await client.get("/logout")
