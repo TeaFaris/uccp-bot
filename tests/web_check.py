@@ -29,6 +29,10 @@ from uccp_bot.services.numbering import new_external_id, next_request_number  # 
 from uccp_bot.utils import utcnow  # noqa: E402
 from uccp_bot.web import auth  # noqa: E402
 from uccp_bot.web.app import build_app  # noqa: E402
+from uccp_bot.utils import utc_from_local  # noqa: E402
+from uccp_bot.db.models import RequestStatusHistory  # noqa: E402
+
+from fixtures import FakeBot  # noqa: E402
 
 
 def check(condition: bool, label: str) -> None:
@@ -76,15 +80,16 @@ async def main() -> None:
         ops_hd = make(3, "Опердир Hotdogger", RoleCode.OPS_DIRECTOR, hd)
         staff = make(4, "Сотрудник точки", RoleCode.STAFF, moose, opera)
         blocked = make(5, "Отключённый", RoleCode.ADMIN, status=UserStatus.BLOCKED)
+        master2 = make(901, "Второй мастер", RoleCode.EXECUTOR)
         await session.flush()
 
-        async def add(outlet, author, cost=None):
+        async def add(outlet, author, cost=None, status=Status.CLOSED):
             req = Request(
                 number=await next_request_number(session), external_id=new_external_id(),
                 author_id=author.id, brand_id=outlet.brand_id, outlet_id=outlet.id,
                 category_id=electric.id, executor_id=master.id,
                 description=f"Заявка по точке {outlet.name}",
-                priority=Priority.HIGH, status=Status.CLOSED,
+                priority=Priority.HIGH, status=status,
                 due_at=utcnow() + dt.timedelta(hours=4),
                 done_at=utcnow(), closed_at=utcnow(),
                 work_cost=cost, material_cost=0,
@@ -98,11 +103,13 @@ async def main() -> None:
 
         r_moose = await add(opera, staff, 250)
         r_hd = await add(airport, staff, 400)
+        r_open = await add(opera, staff, status=Status.NEW)
         await session.commit()
         moose_no, hd_no = r_moose.number, r_hd.number
-        ids = {"moose": r_moose.id, "hd": r_hd.id}
+        ids = {"moose": r_moose.id, "hd": r_hd.id, "open": r_open.id}
 
-    app = build_app(SessionMaker)
+    bot = FakeBot()
+    app = build_app(SessionMaker, bot)
     async with TestClient(TestServer(app)) as client:
         print("=== Вход ===")
         resp = await client.get("/", allow_redirects=False)
@@ -148,6 +155,58 @@ async def main() -> None:
         resp = await client.post(action_url, data={"text": "руководитель", "csrf": csrf(client)},
                                  allow_redirects=False)
         check(resp.status == 403, "Не-админ с верным токеном не может ничего изменить")
+        await client.get("/logout")
+        await login(client, admin.id)
+
+        print("\n=== Действия с заявкой из панели ===")
+        open_url = f"/requests/{ids['open']}"
+        card = await (await client.get(open_url)).text()
+        check("Назначить исполнителя" in card and "Изменить срок" in card
+              and "Отменить заявку" in card, "В карточке открытой заявки есть действия")
+        check('name="csrf"' in card, "Формы защищены токеном")
+        closed_card = await (await client.get(f"/requests/{ids['moose']}")).text()
+        check("Назначить исполнителя" not in closed_card, "У закрытой заявки действий над заявкой нет")
+
+        async def act(name, **fields):
+            resp = await client.post(f"{open_url}/do/{name}", data={"csrf": csrf(client), **fields})
+            return await resp.text()
+
+        bot.clear()
+        page = await act("assign", executor_id=str(master2.id))
+        async with SessionMaker() as session:
+            req = await session.get(Request, ids["open"])
+            last = await session.scalar(select(RequestStatusHistory).where(
+                RequestStatusHistory.request_id == req.id).order_by(RequestStatusHistory.id.desc()))
+        check(req.executor_id == master2.id, "Исполнитель назначен из панели")
+        check("Исполнитель назначен" in page, "После действия показано сообщение об итоге")
+        check(any("Новая заявка" in t for t in bot.to(901)), "Мастер получил заявку в Telegram")
+        check(last.details.endswith("через панель"), "В журнале пометка «через панель»")
+        page2 = await (await client.get(open_url)).text()
+        check("Исполнитель назначен" not in page2, "Сообщение об итоге показывается один раз")
+
+        due_local = (dt.datetime.now() + dt.timedelta(days=3)).replace(hour=15, minute=0,
+                                                                     second=0, microsecond=0)
+        await act("change_due", due=due_local.strftime("%Y-%m-%dT%H:%M"))
+        async with SessionMaker() as session:
+            req = await session.get(Request, ids["open"])
+        check(req.due_at == utc_from_local(due_local), "Срок изменён из панели (время — местное)")
+        page = await act("change_due", due="вчера")
+        check("Укажите дату и время" in page, "Неверная дата — понятная ошибка")
+
+        await act("comment", text="Проверьте щиток в зале")
+        check(any("Проверьте щиток" in t for t in bot.to(4)), "Комментарий дошёл до инициатора")
+
+        await act("cancel", reason="Дубль заявки")
+        async with SessionMaker() as session:
+            req = await session.get(Request, ids["open"])
+        check(req.status == Status.CANCELLED, "Заявка отменена из панели")
+        page = await act("assign", executor_id=str(master2.id))
+        check("недоступно" in page, "Действие над отменённой заявкой — понятный отказ")
+
+        await client.get("/logout")
+        await login(client, chief.id)
+        card = await (await client.get(f"/requests/{ids['moose']}")).text()
+        check("/do/" not in card, "Руководителю формы действий не показываются")
         await client.get("/logout")
         await login(client, admin.id)
 

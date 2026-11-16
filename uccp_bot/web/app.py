@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Optional, Tuple
 
 from aiohttp import web
 from sqlalchemy import func, select
@@ -32,14 +32,16 @@ from ..db.models import (
     User,
     UserStatus,
 )
-from ..services import history
+from ..services import history, request_ops, routing
 from ..services import org as org_service
 from ..services import reports as reports_service
 from ..services import scope
 from ..services.cards import REQUEST_LOAD_OPTIONS, load_request
 from ..services.ops import ActionError
 from ..services.history import ACTION_TITLES
-from ..utils import esc, fmt_dt, fmt_money, parse_date
+from ..utils import (
+    esc, fmt_dt, fmt_money, local_from_utc, parse_amount, parse_date, utc_from_local,
+)
 from . import auth, views
 
 PAGE_SIZE = 25
@@ -340,6 +342,19 @@ async def request_card(request: web.Request) -> web.Response:
             u.id: u.full_name
             for u in (await session.scalars(select(User))).all()
         }
+        actions_html = ""
+        acts = request_ops.available_actions(req, user)
+        if acts:
+            preferred = await routing.find_executors_for_category(session, req.category_id)
+            executors = preferred + [
+                e for e in await routing.all_executors(session) if e not in preferred
+            ]
+            categories = list((await session.scalars(
+                select(Category).where(Category.is_active.is_(True)).order_by(Category.sort_order)
+            )).all())
+            actions_html = _request_actions_html(
+                req, acts, executors, categories, auth.csrf_token(request)
+            )
 
     cost_block = "—"
     if req.cost_exempt:
@@ -388,6 +403,7 @@ async def request_card(request: web.Request) -> web.Response:
         f'<h1>Заявка {esc(req.number)}</h1>'
         f'<p><a href="/requests">← ко всем заявкам</a></p>'
         + views.definition_list(pairs)
+        + actions_html
         + "<h2>История действий</h2>"
         + f'<div class="timeline">{timeline}</div>'
     )
@@ -396,9 +412,189 @@ async def request_card(request: web.Request) -> web.Response:
     )
 
 
+def _request_actions_html(req, acts, executors, categories, csrf: str) -> str:
+    """Блок действий администратора — набор совпадает с кнопками бота."""
+    url = f"/requests/{req.id}/do"
+
+    def form(action: str, title: str, fields: str, button: str, danger: bool = False) -> str:
+        cls = ' class="danger"' if danger else ""
+        return (
+            f'<div class="act"><h3>{esc(title)}</h3>'
+            f'<form method="post" action="{url}/{action}">{views.csrf_input(csrf)}'
+            f'{fields}<button type="submit"{cls}>{esc(button)}</button></form></div>'
+        )
+
+    def textarea(name: str, placeholder: str) -> str:
+        return f'<textarea name="{name}" required placeholder="{esc(placeholder)}"></textarea>'
+
+    blocks = []
+    if "assign" in acts:
+        options = "".join(
+            f'<option value="{e.id}"{" selected" if e.id == req.executor_id else ""}>'
+            f'{esc(e.full_name)}{"" if e.tg_id else " ⚠️ бот не активирован"}</option>'
+            for e in executors
+        )
+        blocks.append(form(
+            "assign", "Назначить исполнителя" + (" / перенаправить" if req.executor_id else ""),
+            f'<select name="executor_id">{options}</select>', "👤 Назначить",
+        ))
+    if "change_due" in acts:
+        local = local_from_utc(req.due_at)
+        current = local.strftime("%Y-%m-%dT%H:%M") if local else ""
+        blocks.append(form("change_due", "Изменить срок",
+                           f'<input type="datetime-local" name="due" value="{current}" required>',
+                           "📅 Сохранить срок"))
+    if "change_category" in acts:
+        options = "".join(
+            f'<option value="{c.id}"{" selected" if c.id == req.category_id else ""}>'
+            f'{esc(c.label)}</option>'
+            for c in categories
+        )
+        blocks.append(form("change_category", "Изменить категорию",
+                           f'<select name="category_id">{options}</select>'
+                           '<span class="muted">Заявка уйдёт исполнителю нового направления.</span>',
+                           "✏️ Сменить категорию"))
+    if "confirm" in acts:
+        blocks.append(form("confirm", "Подтвердить выполнение", "", "✅ Подтвердить и закрыть"))
+    if "return" in acts:
+        blocks.append(form("return", "Вернуть на доработку",
+                           textarea("reason", "Причина возврата — её увидит исполнитель"),
+                           "🔄 Вернуть"))
+    if "cost_ok" in acts:
+        blocks.append(form("cost_ok", "Согласовать стоимость",
+                           f'<span>Итого {esc(fmt_money(req.total_cost))}</span>', "✅ Согласовать"))
+    if "cost_no" in acts:
+        blocks.append(form("cost_no", "Отклонить стоимость",
+                           textarea("reason", "Причина — исполнитель заявит сумму заново"),
+                           "❌ Отклонить", danger=True))
+    if "edit_cost" in acts:
+        work = "" if req.work_cost is None else req.work_cost
+        material = "" if req.material_cost is None else req.material_cost
+        blocks.append(form(
+            "edit_cost", "Изменить стоимость",
+            f'<input name="work" inputmode="decimal" required placeholder="Работы" '
+            f'value="{esc(str(work))}">'
+            f'<input name="material" inputmode="decimal" required placeholder="Материалы" '
+            f'value="{esc(str(material))}">'
+            + textarea("reason", "Причина изменения — сохранится в истории"),
+            "💰 Сохранить стоимость"))
+    if "comment" in acts:
+        blocks.append(form("comment", "Комментарий",
+                           textarea("text", "Увидят инициатор и исполнитель"), "💬 Отправить"))
+    if "cancel" in acts:
+        blocks.append(form("cancel", "Отменить заявку",
+                           textarea("reason", "Причина отмены"), "🚫 Отменить заявку",
+                           danger=True))
+    if not blocks:
+        return ""
+    return "<h2>Действия</h2>" + f'<div class="actions">{"".join(blocks)}</div>'
+
+
+def _form_int(form: dict, name: str, what: str) -> int:
+    try:
+        return int(form.get(name, ""))
+    except (TypeError, ValueError):
+        raise ActionError(f"Выберите {what}.")
+
+
+def _form_amount(form: dict, name: str) -> float:
+    amount = parse_amount(str(form.get(name, "")))
+    if amount is None:
+        raise ActionError("Введите сумму числом, например: 250 или 250.50")
+    return amount
+
+
+def _bot(request: web.Request):
+    return request.app["bot"]
+
+
 RequestAction = Callable[[web.Request, AsyncSession, Request, User, dict], Awaitable[str]]
 # действие -> обработчик, возвращающий текст об успехе; заполняется ниже
 REQUEST_ACTIONS: Dict[str, RequestAction] = {}
+
+
+def request_action_handler(name: str):
+    def register(func: RequestAction) -> RequestAction:
+        REQUEST_ACTIONS[name] = func
+        return func
+    return register
+
+
+@request_action_handler("assign")
+async def _do_assign(request, session, req, actor, form) -> str:
+    executor = await session.get(User, _form_int(form, "executor_id", "исполнителя"))
+    sent = await request_ops.assign(session, _bot(request), req, executor, actor)
+    note = "" if sent else " Мастер ещё не активировал бота — уведомление не доставлено."
+    return f"Исполнитель назначен: {executor.full_name}.{note}"
+
+
+@request_action_handler("change_category")
+async def _do_change_category(request, session, req, actor, form) -> str:
+    category = await session.get(Category, _form_int(form, "category_id", "категорию"))
+    reason = await request_ops.change_category(session, _bot(request), req, category, actor)
+    return {
+        "ok": "Категория изменена, заявка направлена исполнителю нового направления.",
+        "unregistered": "Категория изменена. Исполнитель ещё не активировал бота — "
+                        "заявка передана администратору.",
+        "none": "Категория изменена. Исполнителя по новому направлению нет — назначьте вручную.",
+    }[reason]
+
+
+@request_action_handler("change_due")
+async def _do_change_due(request, session, req, actor, form) -> str:
+    try:
+        local = dt.datetime.fromisoformat(str(form.get("due", "")))
+    except ValueError:
+        raise ActionError("Укажите дату и время нового срока.")
+    await request_ops.change_due(session, _bot(request), req, utc_from_local(local), actor)
+    return f"Срок изменён: {fmt_dt(req.due_at)}."
+
+
+@request_action_handler("comment")
+async def _do_comment(request, session, req, actor, form) -> str:
+    await request_ops.add_comment(session, _bot(request), req, actor, str(form.get("text", "")))
+    return "Комментарий отправлен."
+
+
+@request_action_handler("cancel")
+async def _do_cancel(request, session, req, actor, form) -> str:
+    await request_ops.cancel(session, _bot(request), req, actor, str(form.get("reason", "")))
+    return f"Заявка {req.number} отменена."
+
+
+@request_action_handler("confirm")
+async def _do_confirm(request, session, req, actor, form) -> str:
+    await request_ops.confirm(session, _bot(request), req, actor)
+    return f"Заявка {req.number} подтверждена и закрыта."
+
+
+@request_action_handler("return")
+async def _do_return(request, session, req, actor, form) -> str:
+    await request_ops.return_for_rework(
+        session, _bot(request), req, actor, str(form.get("reason", ""))
+    )
+    return "Заявка возвращена на доработку, исполнитель уведомлён."
+
+
+@request_action_handler("cost_ok")
+async def _do_cost_ok(request, session, req, actor, form) -> str:
+    await request_ops.approve_cost(session, _bot(request), req, actor)
+    return f"Стоимость согласована: {fmt_money(req.total_cost)}."
+
+
+@request_action_handler("cost_no")
+async def _do_cost_no(request, session, req, actor, form) -> str:
+    await request_ops.reject_cost(session, _bot(request), req, actor, str(form.get("reason", "")))
+    return "Стоимость отклонена, исполнитель заявит её заново."
+
+
+@request_action_handler("edit_cost")
+async def _do_edit_cost(request, session, req, actor, form) -> str:
+    await request_ops.edit_cost(
+        session, _bot(request), req, actor,
+        _form_amount(form, "work"), _form_amount(form, "material"), str(form.get("reason", "")),
+    )
+    return f"Стоимость изменена: {fmt_money(req.total_cost)}. Исходные суммы — в истории."
 
 
 @routes.post("/requests/{rid}/do/{action}")
