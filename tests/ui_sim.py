@@ -188,6 +188,19 @@ class Client:
         except AssertionError:
             return False
 
+    async def raw_callback(self, mid: int, data: str) -> None:
+        """Нажатие по конкретной (возможно, устаревшей) кнопке."""
+        message = Message(
+            message_id=mid, date=dt.datetime.now(),
+            chat=Chat(id=self.uid, type="private"),
+            from_user=tg_user(BOT_ID, "UCCP"), text="…",
+        )
+        call = CallbackQuery(id=str(self._next_id()), from_user=self.user,
+                             chat_instance="ci", message=message, data=data)
+        await self.dp.feed_update(
+            self.bot, Update(update_id=self._next_id(), callback_query=call)
+        )
+
     async def click(self, label: str) -> None:
         mid, data = self._find_button(label)
         message = Message(
@@ -776,6 +789,32 @@ async def main() -> None:
     await manager.send("📊 Отчёты")
     check(not manager.has_button("Сводный отчёт"),
           "Сводный отчёт скрыт от неадминистраторов")
+
+    # ---------------- брошенный шаг заявки ----------------
+    print("\n=== Прерванное заполнение заявки ===")
+    OUT.clear()
+    await manager.send("➕ Новая заявка")
+    await manager.click("Moose Café")
+    check(manager.has_button("Moose Opera"), "Дошли до выбора точки")
+    stale_msg = OUT.last_for(5002)["message_id"]
+
+    await manager.send("/start")          # человек бросил заполнение
+    check("С возвращением" in OUT.texts_for(5002), "Бот вернул в главное меню")
+    stale = next(m for m in OUT.messages if m["message_id"] == stale_msg)
+    check(stale["markup"] is None, "Кнопки брошенного шага сняты автоматически")
+
+    # а если старая кнопка всё же нажата — объясняем, а не упираемся в тупик
+    OUT.clear()
+    await manager.send("➕ Новая заявка")
+    await manager.click("Moose Café")
+    mid, cb = manager._find_button("Moose Opera")
+    await manager.send("/start")
+    OUT.clear()
+    await manager.raw_callback(mid, cb)
+    answer = OUT.texts_for(5002)
+    check("было прервано" in answer, "Бот объясняет, почему кнопка не сработала")
+    check("Новая заявка" in answer, "И подсказывает, как оформить заявку заново")
+    check("устарело" not in answer, "Без тупикового «сообщение устарело»")
 
     # ---------------- помощь ----------------
     print("\n=== Помощь ===")

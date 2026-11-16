@@ -19,7 +19,7 @@ from .. import texts
 from ..callbacks import ApprCB, RegCB
 from ..db.models import Brand, Outlet, RoleCode, User, UserStatus
 from ..keyboards.common import BTN_CANCEL, cancel_kb, main_menu, remove_kb
-from ..services import notify, routing
+from ..services import notify, routing, ui
 from ..states import Registration
 from ..utils import esc, fmt_dt, utcnow
 
@@ -55,6 +55,9 @@ async def cmd_start(
     user: Optional[User],
     bot: Bot,
 ) -> None:
+    # если человек бросил заполнение заявки — убираем кнопки того шага,
+    # чтобы по ним нельзя было нажать и попасть в тупик
+    await ui.drop_step_keyboard(bot, state)
     await state.clear()
 
     if user is None:
@@ -308,7 +311,10 @@ async def reg_use_buttons(message: types.Message) -> None:
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: types.Message, state: FSMContext, user: Optional[User]) -> None:
+async def cmd_menu(
+    message: types.Message, state: FSMContext, user: Optional[User], bot: Bot
+) -> None:
+    await ui.drop_step_keyboard(bot, state)
     await state.clear()
     if user is None or not user.is_registered:
         await message.answer(texts.NOT_REGISTERED)

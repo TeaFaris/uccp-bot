@@ -33,13 +33,22 @@ from ..keyboards.common import (
     priority_kb,
     wizard_kb,
 )
-from ..services import flow, history, routing
+from ..services import flow, history, routing, ui
 from ..services.cards import render_card, render_preview
 from ..services.numbering import new_external_id, next_request_number
 from ..states import NewRequest
 from ..utils import esc, fmt_dt, utc_from_local
 
 router = Router(name="create")
+
+
+@router.callback_query.outer_middleware
+async def remember_wizard_message(handler, event: types.CallbackQuery, data):
+    """Запоминаем сообщение шага, чтобы потом снять с него клавиатуру."""
+    state = data.get("state")
+    if state is not None and event.message is not None:
+        await ui.remember_step(state, event.message.chat.id, event.message.message_id)
+    return await handler(event, data)
 
 MAX_MEDIA = 10
 
