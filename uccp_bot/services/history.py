@@ -1,6 +1,7 @@
 """Журнал действий по заявке (п.24). Записи не удаляются."""
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Optional
 
 from sqlalchemy import select
@@ -39,6 +40,11 @@ ACTION_TITLES = {
 }
 
 
+# Откуда выполнено действие. Панель ставит «панель» на время запроса —
+# в журнале видно, что изменение сделано не из бота.
+SOURCE: ContextVar[Optional[str]] = ContextVar("history_source", default=None)
+
+
 async def log(
     session: AsyncSession,
     request: Request,
@@ -48,6 +54,9 @@ async def log(
     new_status: Optional[str] = None,
     details: Optional[str] = None,
 ) -> RequestStatusHistory:
+    source = SOURCE.get()
+    if source:
+        details = f"{details} · через {source}" if details else f"через {source}"
     entry = RequestStatusHistory(
         request_id=request.id,
         user_id=user.id if user else None,

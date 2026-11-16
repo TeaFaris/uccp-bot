@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import texts
 from ..callbacks import CalendarCB, ReqCB, WizardCB
 from ..db.models import (
-    Attachment, Category, Comment, Cost, CostStatus, Request, Status, User,
+    Attachment, Category, Cost, CostStatus, Request, Status, User,
 )
 from ..keyboards.calendar import calendar_kb, time_kb
 from ..keyboards.common import cancel_kb, main_menu, remove_kb, BTN_CANCEL
@@ -27,7 +27,8 @@ from ..keyboards.request import (
     initiator_kb,
     simple_card_kb,
 )
-from ..services import flow, history, notify, routing
+from ..services import history, notify, request_ops, routing
+from ..services.ops import ActionError
 from ..services.cards import load_request, render_card
 from ..states import ExecutorFlow, ManagerFlow, AdminFlow
 from ..utils import esc, fmt_dt, fmt_money, parse_amount, utc_from_local, utcnow
@@ -668,17 +669,11 @@ async def act_confirm(
     request = await _get(session, call, callback_data.request_id)
     if request is None:
         return
-    if user is None or not user.can_confirm:
-        await call.answer(texts.NO_ACCESS, show_alert=True)
+    try:
+        await request_ops.confirm(session, bot, request, user)
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
         return
-    if user.is_executor:
-        await call.answer("Исполнитель не может закрывать свою заявку.", show_alert=True)
-        return
-    if request.status != Status.DONE:
-        await call.answer("Заявка не в статусе «Выполнена».", show_alert=True)
-        return
-
-    await flow.close_request(session, bot, request, user)
     await session.commit()
     await call.answer("Заявка закрыта")
     await _refresh_card(call, request, user)
@@ -720,13 +715,13 @@ async def return_reason(
         await state.clear()
         await message.answer(texts.CANCELLED, reply_markup=main_menu(user))
         return
-    reason = message.text.strip()
-    if len(reason) < 3:
-        await message.answer("Опишите причину подробнее.")
-        return
     data = await state.get_data()
     request = await load_request(session, data["request_id"])
-    await flow.return_request(session, bot, request, user, reason)
+    try:
+        await request_ops.return_for_rework(session, bot, request, user, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer(
@@ -773,25 +768,14 @@ async def save_comment(
         return
     data = await state.get_data()
     request = await load_request(session, data["request_id"])
-    text = message.text.strip()
-    session.add(Comment(request_id=request.id, user_id=user.id, text=text))
-    if user.is_executor:
-        request.executor_comment = text
-    elif user.can_confirm:
-        request.manager_comment = text
-    await history.log(session, request, "comment", user=user, details=text)
+    try:
+        await request_ops.add_comment(session, bot, request, user, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer("💬 Комментарий сохранён.", reply_markup=main_menu(user))
-
-    note = (
-        f"💬 Новый комментарий к заявке <b>{esc(request.number)}</b>\n"
-        f"{esc(user.full_name)}: <i>{esc(text)}</i>"
-    )
-    await notify.notify_request_watchers(
-        session, bot, request, note,
-        to_author=True, to_executor=True, exclude_user_id=user.id,
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -845,7 +829,11 @@ async def act_assign_to(
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
     executor = await session.get(User, int(callback_data.value))
-    sent = await flow.assign_executor(session, bot, request, executor, user)
+    try:
+        sent = await request_ops.assign(session, bot, request, executor, user)
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
     await session.commit()
     await call.answer("Исполнитель назначен")
     note = "" if sent else "\n\n⚠️ " + texts.EXECUTOR_NOT_REGISTERED
@@ -895,16 +883,12 @@ async def act_set_category(
     if user is None or not user.is_admin:
         await call.answer(texts.NO_ACCESS, show_alert=True)
         return
-    old_label = request.category.label
     category = await session.get(Category, int(callback_data.value))
-    request.category_id = category.id
-    request.category = category
-    await history.log(
-        session, request, "category_changed", user=user,
-        details=f"{old_label} → {category.label}",
-    )
-    await session.flush()
-    reason = await flow.dispatch_request(session, bot, request, actor=user)
+    try:
+        reason = await request_ops.change_category(session, bot, request, category, user)
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
     await session.commit()
     await call.answer("Категория изменена")
     suffix = {
@@ -971,29 +955,20 @@ async def admin_due_time(
 ) -> None:
     data = await state.get_data()
     request = await load_request(session, data["request_id"])
-    old_due = request.due_at
     new_local = dt.datetime(
         data["year"], data["month"], data["day"], callback_data.hour, callback_data.minute
     )
-    request.due_at = utc_from_local(new_local)
-    request.is_overdue = False
-    await history.log(
-        session, request, "due_changed", user=user,
-        details=f"{fmt_dt(old_due)} → {fmt_dt(request.due_at)}",
-    )
+    try:
+        await request_ops.change_due(session, bot, request, utc_from_local(new_local), user)
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
+        return
     await session.commit()
     await state.clear()
     await call.answer("Срок изменён")
     await call.message.edit_text(
         f"📅 Новый срок: <b>{fmt_dt(request.due_at)}</b>\n\n" + render_card(request),
         reply_markup=card_kb(request, user),
-    )
-    note = (
-        f"📅 Срок по заявке <b>{esc(request.number)}</b> изменён администратором: "
-        f"{fmt_dt(old_due)} → <b>{fmt_dt(request.due_at)}</b>"
-    )
-    await notify.notify_request_watchers(
-        session, bot, request, note, to_author=True, to_executor=True, exclude_user_id=user.id
     )
 
 
@@ -1071,7 +1046,11 @@ async def cancel_reason(
         return
     data = await state.get_data()
     request = await load_request(session, data["request_id"])
-    await flow.cancel_request(session, bot, request, user, message.text.strip())
+    try:
+        await request_ops.cancel(session, bot, request, user, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1109,35 +1088,16 @@ async def act_cost_approve(
     request = await _get(session, call, callback_data.request_id)
     if request is None:
         return
-    if user is None or not user.can_approve_cost:
-        await call.answer(
-            "Согласовать стоимость может только главный администратор.", show_alert=True
-        )
+    try:
+        await request_ops.approve_cost(session, bot, request, user)
+    except ActionError as exc:
+        await call.answer(str(exc), show_alert=True)
         return
-    if request.cost_status != CostStatus.PENDING:
-        await call.answer(
-            f"Стоимость уже {request.cost_status_title}.", show_alert=True
-        )
-        return
-
-    request.cost_status = CostStatus.APPROVED
-    request.cost_decided_at = utcnow()
-    request.cost_decided_by_id = user.id
-    await history.log(
-        session, request, "cost_approved", user=user,
-        details=f"Согласована стоимость {fmt_money(request.total_cost)}",
-    )
     await session.commit()
     await call.answer("Стоимость согласована")
     await call.message.answer(
         f"✅ Стоимость по заявке <b>{esc(request.number)}</b> согласована: "
         f"{fmt_money(request.total_cost)}"
-    )
-    await notify.send_to_user(
-        bot,
-        request.executor,
-        f"✅ Стоимость по заявке <b>{esc(request.number)}</b> согласована: "
-        f"{fmt_money(request.total_cost)}",
     )
 
 
@@ -1181,30 +1141,17 @@ async def cost_reject_reason(
         return
     data = await state.get_data()
     request = await load_request(session, data["request_id"])
-    reason = message.text.strip()
-
-    request.cost_status = CostStatus.REJECTED
-    request.cost_decided_at = utcnow()
-    request.cost_decided_by_id = user.id
-    request.cost_reject_reason = reason
-    await history.log(
-        session, request, "cost_rejected", user=user,
-        details=f"Отклонена стоимость {fmt_money(request.total_cost)}. Причина: {reason}",
-    )
+    try:
+        await request_ops.reject_cost(session, bot, request, user, message.text)
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer(
         f"❌ Стоимость по заявке <b>{esc(request.number)}</b> отклонена. "
         "Исполнитель уведомлён и может заявить сумму заново.",
         reply_markup=main_menu(user),
-    )
-    await notify.send_to_user(
-        bot,
-        request.executor,
-        f"❌ Стоимость по заявке <b>{esc(request.number)}</b> не согласована.\n"
-        f"Причина: <i>{esc(reason)}</i>\n\n"
-        "Укажите стоимость заново: откройте заявку и нажмите "
-        "«💰 Заявить стоимость».",
     )
 
 
@@ -1323,30 +1270,16 @@ async def edit_cost_reason(
         await state.clear()
         await message.answer(texts.CANCELLED, reply_markup=main_menu(user))
         return
-    reason = message.text.strip()
-    if len(reason) < 3:
-        await message.answer("Опишите причину подробнее — это требование журнала.")
-        return
-
     data = await state.get_data()
     request = await load_request(session, data["request_id"])
     old_work, old_material = request.work_cost, request.material_cost
-
-    request.work_cost = data["new_work"]
-    request.material_cost = data["new_material"]
-    request.cost_status = CostStatus.APPROVED      # правка админа согласована сразу
-    request.cost_decided_at = utcnow()
-    request.cost_decided_by_id = user.id
-    # первоначальные данные сохраняются в истории
-    await history.log(
-        session, request, "cost_edited", user=user,
-        details=(
-            f"Было: работы {fmt_money(old_work)}, материалы {fmt_money(old_material)}. "
-            f"Стало: работы {fmt_money(request.work_cost)}, "
-            f"материалы {fmt_money(request.material_cost)}. "
-            f"Причина: {reason}"
-        ),
-    )
+    try:
+        await request_ops.edit_cost(
+            session, bot, request, user, data["new_work"], data["new_material"], message.text
+        )
+    except ActionError as exc:
+        await message.answer(str(exc))
+        return
     await session.commit()
     await state.clear()
     await message.answer(
@@ -1355,11 +1288,4 @@ async def edit_cost_reason(
         f"стало: {fmt_money(request.total_cost)}\n\n"
         "Первоначальные суммы сохранены в истории.",
         reply_markup=main_menu(user),
-    )
-    await notify.send_to_user(
-        bot,
-        request.executor,
-        f"ℹ️ Главный администратор изменил стоимость по заявке "
-        f"<b>{esc(request.number)}</b>: {fmt_money(request.total_cost)}\n"
-        f"Причина: <i>{esc(reason)}</i>",
     )
